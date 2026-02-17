@@ -33,12 +33,9 @@ def create_page_table(shape: Tuple[int, int], device: torch.device) -> torch.Ten
 def _align_up_32(num: int) -> int:
     return (num + 31) // 32 * 32
 
-def _align_down_32(num: int) -> int:
-    return num // 32 * 32
 
 class Engine:
     def __init__(self, config: EngineConfig):
-        self.model_config = config.model_config
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         assert not torch.cuda.is_initialized()
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
@@ -51,7 +48,6 @@ class Engine:
         init_free_memory = self._sync_get_memory()[1]
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
-        # load model and determine number of pages
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
@@ -64,15 +60,10 @@ class Engine:
             dtype=self.dtype,
         )
         # NOTE: make page table 128 aligned (32 * sizeof(int32) == 128 bytes)
-        logical_max_seq_len = min(config.max_seq_len, self.num_pages)
-        assert logical_max_seq_len > 1
-        if logical_max_seq_len < 32:
-            self.max_seq_len = logical_max_seq_len
-        else:
-            self.max_seq_len = _align_down_32(logical_max_seq_len)
-
+        self.max_seq_len = min(config.max_seq_len, self.num_pages)
+        aligned_max_seq_len = _align_up_32(self.max_seq_len)
         self.page_table = create_page_table(  # + 1 for dummy request
-            (config.max_running_req + 1, self.max_seq_len),
+            (config.max_running_req + 1, aligned_max_seq_len),
             device=self.device,
         )
         self.attn_backend = create_attention_backend(
@@ -81,16 +72,11 @@ class Engine:
             self.kv_cache,
             self.page_table,
         )
-        self.moe_backend = (
-            create_moe_backend(config.moe_backend)
-            if "moe" in config.model_config.model_type
-            else None
-        )
         self.ctx = Context(page_size=1, attn_backend=self.attn_backend)
-        if self.moe_backend:
-            self.ctx.moe_backend = self.moe_backend
         set_global_ctx(self.ctx)
-        self.sampler = Sampler(self.device, self.model_config.vocab_size)
+        if config.model_config.is_moe:
+            self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
+        self.sampler = Sampler(self.device, config.model_config.vocab_size)
 
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
@@ -114,8 +100,8 @@ class Engine:
             cuda_graph_bs=config.cuda_graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
-            max_seq_len=self.max_seq_len,
-            vocab_size=self.model_config.vocab_size,
+            max_seq_len=aligned_max_seq_len,
+            vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
         )
 
@@ -162,11 +148,11 @@ class Engine:
         new_free_memory = self._sync_get_memory()[1]
         cache_per_page = (
             2  # key + value
-            * self.model_config.head_dim
-            * div_even(self.model_config.num_kv_heads, config.tp_info.size)
+            * config.model_config.head_dim
+            * div_even(config.model_config.num_kv_heads, config.tp_info.size)
             * config.page_size
             * self.dtype.itemsize
-            * self.model_config.num_layers
+            * config.model_config.num_layers
         )
         num_pages = config.num_page_override
         if num_pages is None:

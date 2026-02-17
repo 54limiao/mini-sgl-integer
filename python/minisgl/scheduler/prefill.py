@@ -153,7 +153,6 @@ class PrefillManager:
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
                 self.pending_list.pop(i)
-                # if there is a chunked_req associated with the pending_req (partially prefilled), return it to release resources
                 return req.chunked_req
         return None
 

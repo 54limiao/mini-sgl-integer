@@ -75,40 +75,32 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
 
-    def _process_last_data(
-        self, last_data: ForwardData | None, ongoing_data: ForwardData | None
-    ) -> None:
+    def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
             return
+
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
-
+        new_finished_reqs: Set[Req] = set()
         for i, req in enumerate(batch.reqs):
-            if req in self.finished_reqs or isinstance(req, ChunkedReq):
+            if isinstance(req, ChunkedReq):
                 continue
 
-            next_token_id = next_tokens_cpu[i]
-            req.append_host(next_token_id.unsqueeze(0))
-            next_token = int(next_token_id.item())
+            next_token = next_tokens_cpu[i]
+            req.append_host(next_token.unsqueeze(0))
+            next_token = int(next_token.item())
             finished = not req.can_decode
             if not req.sampling_params.ignore_eos:
                 finished |= next_token == self.eos_token_id
             reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
 
-            # free resources if the req is finished and not ongoing
-            if finished:
-                self.finished_reqs.add(req)
+            # NOTE: overlap scheduling may make the request freed twice, skip second free
+            if finished and req not in self.finished_reqs:
                 self.decode_manager.remove_req(req)
-                logger.debug_rank0("Request %s is finished", req)
-
-        # free resources for finished but not ongoing reqs
-        ongoing_reqs = ongoing_data[0].batch.reqs if ongoing_data else []
-        for req in self.finished_reqs.difference(ongoing_reqs):
-            self._free_req_resources(req)
-
-        # keep only ongoing reqs in the finished set
-        self.finished_reqs.intersection_update(ongoing_reqs)
+                self._free_req_resources(req)
+                new_finished_reqs.add(req)
+        self.finished_reqs = new_finished_reqs
         self.send_result(reply)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
@@ -133,7 +125,11 @@ class Scheduler(SchedulerIOMixin):
                 )
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
-            self.abort_req(msg.uid)
+            logger.debug_rank0("Aborting request %d", msg.uid)
+            req_to_free = self.prefill_manager.abort_req(msg.uid)
+            req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
+            if req_to_free is not None:
+                self._free_req_resources(req_to_free)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
@@ -146,21 +142,6 @@ class Scheduler(SchedulerIOMixin):
             self.page_table[req.table_idx, : req.cached_len],
         )
 
-    def abort_req(self, uid: int) -> None:
-        logger.info_rank0(f"Aborting request {uid}")
-
-        # try to abort from prefill first
-        # if the request is in the pending list or being prefilled, remove it and free resources
-        if req_to_free := self.prefill_manager.abort_req(uid):
-            self._free_req_resources(req_to_free)
-            return
-
-        # try to abort from decode
-        if req_to_free := self.decode_manager.abort_req(uid):
-            self.finished_reqs.discard(req_to_free)
-            self._free_req_resources(req_to_free)
-            return
-
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         needed_size = sum(r.extend_len for r in batch.reqs)
         out_loc = self.cache_manager.allocate(needed_size)
@@ -172,7 +153,6 @@ class Scheduler(SchedulerIOMixin):
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
 
-        assert all(r.device_len < self.engine.max_seq_len for r in batch.reqs)
         # NOTE: write out_loc to page_table before `prepare_metadata`
         self.page_table[input_mapping] = batch.out_loc
         self.engine.attn_backend.prepare_metadata(batch)
@@ -228,7 +208,7 @@ class Scheduler(SchedulerIOMixin):
                 self.engine.stream.wait_stream(self.stream)
                 ongoing_data = (forward_input, self._forward(forward_input))
 
-        self._process_last_data(last_data, ongoing_data)
+        self._process_last_data(last_data)
         return ongoing_data
 
     def normal_loop(self) -> None:
@@ -241,7 +221,7 @@ class Scheduler(SchedulerIOMixin):
         if forward_input is not None:
             ongoing_data = (forward_input, self._forward(forward_input))
 
-        self._process_last_data(ongoing_data, None)
+        self._process_last_data(ongoing_data)
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:

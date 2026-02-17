@@ -5,8 +5,8 @@ from typing import List
 
 import torch
 from minisgl.message import (
-    AbortMsg,
     AbortBackendMsg,
+    AbortMsg,
     BaseBackendMsg,
     BaseFrontendMsg,
     BaseTokenizerMsg,

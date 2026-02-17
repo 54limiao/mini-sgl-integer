@@ -35,6 +35,10 @@ class ModelConfig:
     model_type: str
     architectures: list[str]
 
+    @property
+    def is_moe(self) -> bool:
+        return "moe" in self.model_type
+
     @classmethod
     def from_hf(cls, config: LlamaConfig) -> ModelConfig:
         num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)

@@ -197,10 +197,8 @@ class FrontendManager:
                     raise asyncio.CancelledError
                 yield chunk
         except asyncio.CancelledError:
-            logger.info("Request cancelled for user %s", uid)
-            raise
-        finally:
             asyncio.create_task(self.abort_user(uid))
+            raise
 
     async def abort_user(self, uid: int):
         await asyncio.sleep(0.1)
