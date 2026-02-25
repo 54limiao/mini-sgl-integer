@@ -252,7 +252,23 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "bfloat16": torch.bfloat16,
         "float32": torch.float32,
     }
-    kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
+    dtype = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
+
+    # Detect quantized models and adjust dtype if needed
+    # FlashInfer doesn't support float32, so use bfloat16 for quantized models
+    from minisgl.utils import cached_load_hf_config
+
+    hf_config = cached_load_hf_config(kwargs["model_path"])
+    quant_config = getattr(hf_config, "quantization_config", None)
+    if quant_config is not None and dtype == torch.float32:
+        logger = init_logger(__name__)
+        logger.info(
+            "Quantized model detected with float32 dtype. "
+            "Overriding to bfloat16 for FlashInfer compatibility."
+        )
+        dtype = torch.bfloat16
+
+    kwargs["dtype"] = dtype
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
 

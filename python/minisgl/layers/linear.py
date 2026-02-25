@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -8,6 +8,17 @@ from minisgl.distributed import DistributedCommunicator, get_tp_info
 from minisgl.utils import div_even
 
 from .base import BaseOP
+from .quantization.w8a8_int8 import W8A8Int8LinearMethod
+
+# Lazy initialization of quantizer
+_w8a8_quantizer: Optional[W8A8Int8LinearMethod] = None
+
+
+def _get_w8a8_quantizer() -> W8A8Int8LinearMethod:
+    global _w8a8_quantizer
+    if _w8a8_quantizer is None:
+        _w8a8_quantizer = W8A8Int8LinearMethod()
+    return _w8a8_quantizer
 
 
 class _LinearTPImpl(BaseOP):
@@ -29,6 +40,9 @@ class _LinearTPImpl(BaseOP):
         self.bias = torch.empty(local_osize) if has_bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Check if this is a quantized layer (int8 weight with weight_scale)
+        if self.weight.dtype == torch.int8 and hasattr(self, "weight_scale"):
+            return _get_w8a8_quantizer().apply_weights(self, x, self.bias)
         return F.linear(x, self.weight, self.bias)
 
 
@@ -100,7 +114,11 @@ class LinearOProj(_LinearTPImpl):
         super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
+        # Check if this is a quantized layer
+        if self.weight.dtype == torch.int8 and hasattr(self, "weight_scale"):
+            y = _get_w8a8_quantizer().apply_weights(self, x, self.bias)
+        else:
+            y = F.linear(x, self.weight, self.bias)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y
@@ -121,7 +139,11 @@ class LinearRowParallel(_LinearTPImpl):
         super().__init__(input_size, output_size, local_input_size, local_output_size, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
+        # Check if this is a quantized layer
+        if self.weight.dtype == torch.int8 and hasattr(self, "weight_scale"):
+            y = _get_w8a8_quantizer().apply_weights(self, x, self.bias)
+        else:
+            y = F.linear(x, self.weight, self.bias)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y

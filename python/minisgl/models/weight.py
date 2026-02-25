@@ -42,28 +42,50 @@ def _shard_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Te
 
 
 def _merge_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Merge Q/K/V and Gate/Up projections into single tensors."""
     filtered_state_dict: Dict[str, torch.Tensor] = {}
+    original_keys = set(state_dict.keys())
+
     for key in list(state_dict.keys()):
-        if key.count(".q_proj"):
-            q_proj = state_dict[key]
-            k_proj = state_dict[key.replace(".q_proj", ".k_proj")]
-            v_proj = state_dict[key.replace(".q_proj", ".v_proj")]
-            new_key = key.replace(".q_proj", ".qkv_proj")
-            filtered_state_dict[new_key] = torch.cat([q_proj, k_proj, v_proj], dim=0)
-            del state_dict[key]
-            del state_dict[key.replace(".q_proj", ".k_proj")]
-            del state_dict[key.replace(".q_proj", ".v_proj")]
-        elif key.count(".gate_proj"):
-            gate_proj = state_dict[key]
-            up_proj = state_dict[key.replace(".gate_proj", ".up_proj")]
-            new_key = key.replace(".gate_proj", ".gate_up_proj")
-            filtered_state_dict[new_key] = torch.cat([gate_proj, up_proj], dim=0)
-            del state_dict[key]
-            del state_dict[key.replace(".gate_proj", ".up_proj")]
-        elif key.count(".k_proj") or key.count(".v_proj") or key.count("up_proj"):
+        # Skip already processed keys
+        if key in filtered_state_dict:
             continue
+
+        # Merge QKV projections (weight and weight_scale)
+        if ".q_proj." in key:
+            k_key = key.replace(".q_proj.", ".k_proj.")
+            v_key = key.replace(".q_proj.", ".v_proj.")
+
+            if k_key in original_keys and v_key in original_keys:
+                # Concatenate Q, K, V
+                q_val = state_dict[key]
+                k_val = state_dict[k_key]
+                v_val = state_dict[v_key]
+                new_key = key.replace(".q_proj.", ".qkv_proj.")
+                filtered_state_dict[new_key] = torch.cat([q_val, k_val, v_val], dim=0)
+            else:
+                filtered_state_dict[key] = state_dict[key]
+
+        # Merge Gate/Up projections (weight and weight_scale)
+        elif ".gate_proj." in key:
+            up_key = key.replace(".gate_proj.", ".up_proj.")
+
+            if up_key in original_keys:
+                gate_val = state_dict[key]
+                up_val = state_dict[up_key]
+                new_key = key.replace(".gate_proj.", ".gate_up_proj.")
+                filtered_state_dict[new_key] = torch.cat([gate_val, up_val], dim=0)
+            else:
+                filtered_state_dict[key] = state_dict[key]
+
+        # Skip K, V, Up (already merged)
+        elif ".k_proj." in key or ".v_proj." in key or ".up_proj." in key:
+            continue
+
+        # Keep all other keys (including norms, embeddings, o_proj, down_proj, weight_scale)
         else:
             filtered_state_dict[key] = state_dict[key]
+
     return filtered_state_dict
 
 

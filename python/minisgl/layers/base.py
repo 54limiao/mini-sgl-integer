@@ -69,7 +69,11 @@ class BaseOP:
                     item = state_dict.pop(_concat_prefix(prefix, name))
 
                 assert isinstance(item, torch.Tensor)
-                assert param.shape == item.shape and param.dtype == item.dtype
+                # For regular weights, shape and dtype must match
+                # For quantized weights (int8), allow dtype mismatch since weight is stored as int8
+                if param.dtype != torch.int8 and item.dtype != torch.int8:
+                    assert param.shape == item.shape, f"Shape mismatch for {prefix}.{name}: {param.shape} vs {item.shape}"
+                    assert param.dtype == item.dtype, f"Dtype mismatch for {prefix}.{name}: {param.dtype} vs {item.dtype}"
 
                 setattr(self, name, item)
 
@@ -77,6 +81,22 @@ class BaseOP:
                 param.load_state_dict(
                     state_dict, prefix=_concat_prefix(prefix, name), _internal=True
                 )
+
+        # Handle additional quantization parameters (e.g., weight_scale)
+        prefix_with_dot = prefix + "." if prefix else ""
+        for key in list(state_dict.keys()):
+            if prefix and not key.startswith(prefix_with_dot):
+                continue
+
+            rel_key = key[len(prefix_with_dot):] if prefix else key
+
+            # Check if this is a quantization parameter (ends with .weight_scale)
+            if rel_key.endswith(".weight_scale") or rel_key == "weight_scale":
+                item = state_dict.pop(key)
+                assert isinstance(item, torch.Tensor)
+                # Store as attribute (e.g., "weight_scale" or "gate_up_proj.weight_scale")
+                attr_name = rel_key.replace(".", "_")
+                setattr(self, attr_name, item)
 
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")

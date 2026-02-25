@@ -145,9 +145,21 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
-            return {
-                k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device).items()
-            }
+            state_dict = load_weight(config.model_path, self.device)
+            processed_state_dict: Dict[str, torch.Tensor] = {}
+
+            for k, v in state_dict.items():
+                if v.dtype == torch.int8:
+                    # Quantized int8 weight - keep as int8
+                    processed_state_dict[k] = v
+                elif k.endswith("_scale"):
+                    # Weight scale - keep as float32
+                    processed_state_dict[k] = v
+                else:
+                    # Regular weight - convert to model dtype
+                    processed_state_dict[k] = v.to(self.dtype)
+
+            return processed_state_dict
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
