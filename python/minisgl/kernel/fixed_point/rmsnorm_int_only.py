@@ -14,34 +14,42 @@ import triton.language as tl
 import numpy as np
 
 # ============================================================================
-# LUT Generation (done once at import time)
+# LUT Generation (lazy initialization for multi-process support)
 # ============================================================================
 
-# Precompute LUT for 1/sqrt(x) where x in [0, 4)
-# Output format: Q0.24 for better precision during intermediate computation
 _INV_SQRT_LUT_SIZE = 1024
-_INV_SQRT_LUT = torch.zeros(_INV_SQRT_LUT_SIZE, dtype=torch.int32)
-# Avoid divide by zero by starting from index 1
-lut_values = np.linspace(0.0, 4.0, _INV_SQRT_LUT_SIZE)
-_INV_SQRT_LUT[1:] = torch.tensor(
-    np.clip((1.0 / np.sqrt(lut_values[1:])) * (1 << 24) + 0.5, 0, (1 << 24) - 1),
-    dtype=torch.int32
-)
-
-# Move LUT to GPU if available
-if torch.cuda.is_available():
-    _INV_SQRT_LUT = _INV_SQRT_LUT.cuda()
-
-# De Bruijn table for CLZ (Count Leading Zeros) - 32-bit version
-_DEBRUIJN_TABLE = torch.tensor([
-    0, 0, 16, 2, 28, 16, 2, 22, 30, 20, 18, 10, 12, 4, 6, 22,
-    30, 14, 28, 20, 18, 10, 12, 6, 14, 26, 8, 4, 26, 8, 24, 24,
-], dtype=torch.int32)
-
-if torch.cuda.is_available():
-    _DEBRUIJN_TABLE = _DEBRUIJN_TABLE.cuda()
-
+_INV_SQRT_LUT: torch.Tensor | None = None
+_DEBRUIJN_TABLE: torch.Tensor | None = None
 _DEBRUIJN_MULT = 0x06EB14F9
+
+
+def _get_lut_tables() -> tuple[torch.Tensor, torch.Tensor]:
+    """Get or create LUT tables (lazy initialization for multi-process support)."""
+    global _INV_SQRT_LUT, _DEBRUIJN_TABLE
+    
+    if _INV_SQRT_LUT is None:
+        # Precompute LUT for 1/sqrt(x) where x in [0, 4)
+        # Output format: Q0.24 for better precision during intermediate computation
+        _INV_SQRT_LUT = torch.zeros(_INV_SQRT_LUT_SIZE, dtype=torch.int32)
+        # Avoid divide by zero by starting from index 1
+        lut_values = np.linspace(0.0, 4.0, _INV_SQRT_LUT_SIZE)
+        _INV_SQRT_LUT[1:] = torch.tensor(
+            np.clip((1.0 / np.sqrt(lut_values[1:])) * (1 << 24) + 0.5, 0, (1 << 24) - 1),
+            dtype=torch.int32
+        )
+        
+        # De Bruijn table for CLZ (Count Leading Zeros) - 32-bit version
+        _DEBRUIJN_TABLE = torch.tensor([
+            0, 0, 16, 2, 28, 16, 2, 22, 30, 20, 18, 10, 12, 4, 6, 22,
+            30, 14, 28, 20, 18, 10, 12, 6, 14, 26, 8, 4, 26, 8, 24, 24,
+        ], dtype=torch.int32)
+        
+        # Move to GPU if available
+        if torch.cuda.is_available():
+            _INV_SQRT_LUT = _INV_SQRT_LUT.cuda()
+            _DEBRUIJN_TABLE = _DEBRUIJN_TABLE.cuda()
+    
+    return _INV_SQRT_LUT, _DEBRUIJN_TABLE
 
 
 # ============================================================================
