@@ -5,7 +5,7 @@ from .config import ModelConfig
 
 # Environment variable to control integer mode
 # Set MINISGL_INTEGER_MODE=1 to use integer-only RMSNorm
-_INTEGER_MODE = os.environ.get("MINISGL_INTEGER_MODE", "0")
+_INTEGER_MODE = os.environ.get("MINISGL_INTEGER_MODE", "0") == "1"
 
 _MODEL_REGISTRY = {
     "LlamaForCausalLM": (".llama", "LlamaForCausalLM"),
