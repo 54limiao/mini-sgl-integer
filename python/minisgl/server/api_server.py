@@ -170,7 +170,9 @@ class FrontendManager:
 
             chunk = {
                 "id": f"cmpl-{uid}",
-                "object": "text_completion.chunk",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": get_global_state().config.model_path.split("/")[-1],
                 "choices": [{"delta": delta, "index": 0, "finish_reason": None}],
             }
             yield f"data: {json.dumps(chunk)}\n\n".encode()
@@ -181,7 +183,9 @@ class FrontendManager:
         # send final finish_reason
         end_chunk = {
             "id": f"cmpl-{uid}",
-            "object": "text_completion.chunk",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": get_global_state().config.model_path.split("/")[-1],
             "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
         }
         yield f"data: {json.dumps(end_chunk)}\n\n".encode()
@@ -278,10 +282,36 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         )
     )
 
-    return StreamingResponse(
-        state.stream_with_cancellation(state.stream_chat_completions(uid), request, uid),
-        media_type="text/event-stream",
-    )
+    if req.stream:
+        return StreamingResponse(
+            state.stream_with_cancellation(state.stream_chat_completions(uid), request, uid),
+            media_type="text/event-stream",
+        )
+    else:
+        # Non-streaming mode: collect all output and return at once
+        content = ""
+        async for ack in state.wait_for_ack(uid):
+            if ack.incremental_output:
+                content += ack.incremental_output
+            if ack.finished:
+                break
+        
+        response = {
+            "id": f"cmpl-{uid}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": state.config.model_path.split("/")[-1],
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": None,
+        }
+        return response
 
 
 @app.get("/v1/models")
