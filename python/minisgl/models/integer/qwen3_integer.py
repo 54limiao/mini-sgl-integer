@@ -1,7 +1,7 @@
 """
-Qwen3 model with integer-only RMSNorm.
+Qwen3 model with integer-only RMSNorm and MLP.
 
-This is a variant of Qwen3 that uses integer-only RMSNorm while keeping
+This is a variant of Qwen3 that uses integer-only components while keeping
 the rest of the computation in floating point. Useful for validating the
 integer inference path.
 """
@@ -20,6 +20,7 @@ from minisgl.utils import nvtx_annotate
 from ..base import BaseLLMModel
 from ..utils import GatedMLP as Qwen3MLP
 from ..utils import RopeAttn as Qwen3Attn
+from ..utils_integer import GatedMLPInteger, RopeAttnInteger
 
 if TYPE_CHECKING:
     from ..config import ModelConfig
@@ -32,14 +33,39 @@ INTEGER_MODE_ENABLED = os.environ.get("MINISGL_INTEGER_MODE", "0")
 # Max layers to apply integer mode (-1 for all)
 MAX_INTEGER_LAYERS = int(os.environ.get("MINISGL_MAX_INT_LAYERS", "-1"))
 
+# Environment variable to control integer MLP
+# Set MINISGL_INTEGER_MLP=1 to enable integer MLP
+INTEGER_MLP_ENABLED = os.environ.get("MINISGL_INTEGER_MLP", "0")
+
+
+def _str_to_bool(s: str | None) -> bool:
+    """Convert string to boolean."""
+    if s is None:
+        return False
+    return s.lower() in ("1", "true", "yes", "on")
+
+
+_INTEGER_MODE_ENABLED = _str_to_bool(INTEGER_MODE_ENABLED)
+_INTEGER_MLP_ENABLED = _str_to_bool(INTEGER_MLP_ENABLED)
+
 
 class Qwen3DecoderLayerInteger(BaseOP):
-    """Qwen3 decoder layer with integer-only RMSNorm."""
+    """Qwen3 decoder layer with integer-only components."""
 
     def __init__(self, config: ModelConfig, layer_id: int):
+        # Check if we should apply integer/hybrid mode to this layer
+        apply_to_this_layer = MAX_INTEGER_LAYERS < 0 or layer_id < MAX_INTEGER_LAYERS
+        
+        # Choose MLP implementation
+        if apply_to_this_layer and _INTEGER_MLP_ENABLED:
+            self.mlp = GatedMLPInteger(config)
+        else:
+            self.mlp = Qwen3MLP(config)
+        
+        # Attention (currently always float, can be made integer later)
         self.self_attn = Qwen3Attn(config, layer_id, has_qk_norm=True)
-        self.mlp = Qwen3MLP(config)
 
+        # Layernorm
         from minisgl.layers import RMSNormFused
         self.input_layernorm = RMSNormFused(
             size=config.hidden_size,
@@ -50,20 +76,16 @@ class Qwen3DecoderLayerInteger(BaseOP):
             eps=config.rms_norm_eps,
         )
 
-        # Check if we should apply integer/hybrid mode to this layer
-        apply_to_this_layer = MAX_INTEGER_LAYERS < 0 or layer_id < MAX_INTEGER_LAYERS
-        
-        if apply_to_this_layer:
-            if INTEGER_MODE_ENABLED:
-                # Full integer mode: fixed-point residual + fixed-point RMSNorm
-                self.input_layernorm = RMSNormFusedInteger(
-                    size=config.hidden_size,
-                    eps=config.rms_norm_eps,
-                )
-                self.post_attention_layernorm = RMSNormFusedInteger(
-                    size=config.hidden_size,
-                    eps=config.rms_norm_eps,
-                )
+        # Apply integer RMSNorm if enabled
+        if apply_to_this_layer and _INTEGER_MODE_ENABLED:
+            self.input_layernorm = RMSNormFusedInteger(
+                size=config.hidden_size,
+                eps=config.rms_norm_eps,
+            )
+            self.post_attention_layernorm = RMSNormFusedInteger(
+                size=config.hidden_size,
+                eps=config.rms_norm_eps,
+            )
 
         self._layer_id = layer_id
 
@@ -83,7 +105,7 @@ class Qwen3DecoderLayerInteger(BaseOP):
 
 
 class Qwen3ModelInteger(BaseOP):
-    """Qwen3 model with integer-only RMSNorm."""
+    """Qwen3 model with integer-only components."""
 
     def __init__(self, config: ModelConfig):
         self.embed_tokens = VocabParallelEmbedding(
@@ -94,18 +116,12 @@ class Qwen3ModelInteger(BaseOP):
             [Qwen3DecoderLayerInteger(config, layer_id) for layer_id in range(config.num_layers)]
         )
 
-        # Use integer RMSNorm for final norm if enabled
-        if INTEGER_MODE_ENABLED:
-                self.norm = RMSNormFusedInteger(
-                    size=config.hidden_size,
-                    eps=config.rms_norm_eps,
-                )
-        else:
-            from minisgl.layers import RMSNormFused
-            self.norm = RMSNormFused(
-                size=config.hidden_size,
-                eps=config.rms_norm_eps,
-            )
+        # Final norm
+        from minisgl.layers import RMSNormFused
+        self.norm = RMSNormFused(
+            size=config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
@@ -118,7 +134,7 @@ class Qwen3ModelInteger(BaseOP):
 
 
 class Qwen3ForCausalLMInteger(BaseLLMModel):
-    """Qwen3 for causal LM with integer-only RMSNorm."""
+    """Qwen3 for causal LM with integer-only components."""
 
     def __init__(self, config: ModelConfig):
         self.model = Qwen3ModelInteger(config)
@@ -136,4 +152,4 @@ class Qwen3ForCausalLMInteger(BaseLLMModel):
         return logits
 
 
-__all__ = ["Qwen3ForCausalLMInteger", "INTEGER_MODE_ENABLED"]
+__all__ = ["Qwen3ForCausalLMInteger", "_INTEGER_MODE_ENABLED", "_INTEGER_MLP_ENABLED"]

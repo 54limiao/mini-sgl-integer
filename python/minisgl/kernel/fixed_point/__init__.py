@@ -25,6 +25,9 @@ from .rmsnorm_int_only import rmsnorm_int_only, fused_add_rmsnorm_int_only
 # V2: Overflow-safe implementation
 from .rmsnorm_int_only_v2 import rmsnorm_int_only_v2, fused_add_rmsnorm_int_only_v2
 
+# Activation functions
+from .silu_and_mul_int_only import silu_and_mul_int_only
+
 __all__ = [
     "FIXED_POINT_SCALE",
     "to_fixed",
@@ -35,4 +38,6 @@ __all__ = [
     # V2
     "rmsnorm_int_only_v2",
     "fused_add_rmsnorm_int_only_v2",
+    # Activation
+    "silu_and_mul_int_only",
 ]
