@@ -4,6 +4,9 @@ performs integer RMSNorm, and converts back to float.
 
 This is useful for validating integer-only inference path while keeping
 the rest of the model in floating point.
+
+V2 uses overflow-safe algorithm that normalizes values to int16 range
+before computing sum of squares.
 """
 
 from typing import Tuple
@@ -27,14 +30,14 @@ def from_fixed(x: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Ten
 
 
 class RMSNormInteger(BaseOP):
-    """RMSNorm using pure integer arithmetic (Q15.16 fixed-point)."""
+    """RMSNorm using pure integer arithmetic (Q15.16 fixed-point) - V2 overflow-safe."""
 
     def __init__(self, size: int, eps: float) -> None:
-        from minisgl.kernel.fixed_point import rmsnorm_int_only
+        from minisgl.kernel.fixed_point import rmsnorm_int_only_v2
 
         self.eps = eps
         self.weight = torch.empty(size)  # Float weight, converted at runtime
-        self._rmsnorm_int = rmsnorm_int_only
+        self._rmsnorm_int = rmsnorm_int_only_v2
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Save input dtype
@@ -44,7 +47,7 @@ class RMSNormInteger(BaseOP):
         x_fixed = to_fixed(x)
         weight_fixed = to_fixed(self.weight)
 
-        # Integer RMSNorm
+        # Integer RMSNorm (V2 overflow-safe)
         out_fixed = self._rmsnorm_int(x_fixed, weight_fixed, self.eps)
 
         # Convert back to float, preserving input dtype
@@ -52,14 +55,14 @@ class RMSNormInteger(BaseOP):
 
 
 class RMSNormFusedInteger(BaseOP):
-    """Fused add + RMSNorm using pure integer arithmetic (Q15.16 fixed-point)."""
+    """Fused add + RMSNorm using pure integer arithmetic (Q15.16 fixed-point) - V2 overflow-safe."""
 
     def __init__(self, size: int, eps: float) -> None:
-        from minisgl.kernel.fixed_point import fused_add_rmsnorm_int_only
+        from minisgl.kernel.fixed_point import fused_add_rmsnorm_int_only_v2
 
         self.eps = eps
         self.weight = torch.empty(size)  # Float weight, converted at runtime
-        self._fused_add_rmsnorm_int = fused_add_rmsnorm_int_only
+        self._fused_add_rmsnorm_int = fused_add_rmsnorm_int_only_v2
 
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
@@ -76,7 +79,7 @@ class RMSNormFusedInteger(BaseOP):
         residual_fixed = to_fixed(residual)
         weight_fixed = to_fixed(self.weight)
 
-        # Fused add + integer RMSNorm
+        # Fused add + integer RMSNorm (V2 overflow-safe)
         out_fixed, residual_out_fixed = self._fused_add_rmsnorm_int(
             residual_fixed, x_fixed, weight_fixed, self.eps
         )
@@ -86,12 +89,12 @@ class RMSNormFusedInteger(BaseOP):
 
     def _rmsnorm_only(self, x: torch.Tensor) -> torch.Tensor:
         """Fallback for no residual case."""
-        from minisgl.kernel.fixed_point import rmsnorm_int_only
+        from minisgl.kernel.fixed_point import rmsnorm_int_only_v2
 
         input_dtype = x.dtype
         x_fixed = to_fixed(x)
         weight_fixed = to_fixed(self.weight)
-        out_fixed = rmsnorm_int_only(x_fixed, weight_fixed, self.eps)
+        out_fixed = rmsnorm_int_only_v2(x_fixed, weight_fixed, self.eps)
         return from_fixed(out_fixed, input_dtype)
 
 

@@ -27,10 +27,10 @@ if TYPE_CHECKING:
 
 # Environment variable to control integer mode
 # Set MINISGL_INTEGER_MODE=1 to enable integer RMSNorm
-INTEGER_MODE_ENABLED = os.environ.get("MINISGL_INTEGER_MODE", "0") == "1"
+INTEGER_MODE_ENABLED = os.environ.get("MINISGL_INTEGER_MODE", "0")
 
-# Debug mode: print hidden states
-DEBUG_HIDDEN_STATES = os.environ.get("MINISGL_DEBUG_HIDDEN", "0") == "1"
+# Max layers to apply integer mode (-1 for all)
+MAX_INTEGER_LAYERS = int(os.environ.get("MINISGL_MAX_INT_LAYERS", "-1"))
 
 
 class Qwen3DecoderLayerInteger(BaseOP):
@@ -40,27 +40,30 @@ class Qwen3DecoderLayerInteger(BaseOP):
         self.self_attn = Qwen3Attn(config, layer_id, has_qk_norm=True)
         self.mlp = Qwen3MLP(config)
 
-        # Use integer RMSNorm if enabled
-        if INTEGER_MODE_ENABLED and layer_id < 7:
-            self.input_layernorm = RMSNormFusedInteger(
-                size=config.hidden_size,
-                eps=config.rms_norm_eps,
-            )
-            self.post_attention_layernorm = RMSNormFusedInteger(
-                size=config.hidden_size,
-                eps=config.rms_norm_eps,
-            )
-        else:
-            # Fallback to float RMSNorm
-            from minisgl.layers import RMSNormFused
-            self.input_layernorm = RMSNormFused(
-                size=config.hidden_size,
-                eps=config.rms_norm_eps,
-            )
-            self.post_attention_layernorm = RMSNormFused(
-                size=config.hidden_size,
-                eps=config.rms_norm_eps,
-            )
+        from minisgl.layers import RMSNormFused
+        self.input_layernorm = RMSNormFused(
+            size=config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+        self.post_attention_layernorm = RMSNormFused(
+            size=config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+
+        # Check if we should apply integer/hybrid mode to this layer
+        apply_to_this_layer = MAX_INTEGER_LAYERS < 0 or layer_id < MAX_INTEGER_LAYERS
+        
+        if apply_to_this_layer:
+            if INTEGER_MODE_ENABLED:
+                # Full integer mode: fixed-point residual + fixed-point RMSNorm
+                self.input_layernorm = RMSNormFusedInteger(
+                    size=config.hidden_size,
+                    eps=config.rms_norm_eps,
+                )
+                self.post_attention_layernorm = RMSNormFusedInteger(
+                    size=config.hidden_size,
+                    eps=config.rms_norm_eps,
+                )
 
         self._layer_id = layer_id
 
@@ -68,31 +71,14 @@ class Qwen3DecoderLayerInteger(BaseOP):
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if DEBUG_HIDDEN_STATES and self._layer_id == 0:
-            print(f"[Layer {self._layer_id}] Before input_ln: x range=[{x.min().item():.4f}, {x.max().item():.4f}], mean={x.mean().item():.6f}")
-            if residual is not None:
-                print(f"[Layer {self._layer_id}] Before input_ln: residual range=[{residual.min().item():.4f}, {residual.max().item():.4f}]")
-        
         x, residual = self.input_layernorm.forward(x, residual)
-        
-        if DEBUG_HIDDEN_STATES and self._layer_id == 0:
-            print(f"[Layer {self._layer_id}] After input_ln: x range=[{x.min().item():.4f}, {x.max().item():.4f}], mean={x.mean().item():.6f}")
-        
+
         x = self.self_attn.forward(x)
-        
-        if DEBUG_HIDDEN_STATES and self._layer_id == 0:
-            print(f"[Layer {self._layer_id}] After attn: x range=[{x.min().item():.4f}, {x.max().item():.4f}], mean={x.mean().item():.6f}")
-        
+
         x, residual = self.post_attention_layernorm.forward(x, residual)
-        
-        if DEBUG_HIDDEN_STATES and self._layer_id == 0:
-            print(f"[Layer {self._layer_id}] After post_attn_ln: x range=[{x.min().item():.4f}, {x.max().item():.4f}], mean={x.mean().item():.6f}")
-        
+
         x = self.mlp.forward(x)
-        
-        if DEBUG_HIDDEN_STATES and self._layer_id == 0:
-            print(f"[Layer {self._layer_id}] After MLP: x range=[{x.min().item():.4f}, {x.max().item():.4f}], mean={x.mean().item():.6f}")
-        
+
         return x, residual
 
 
@@ -109,11 +95,11 @@ class Qwen3ModelInteger(BaseOP):
         )
 
         # Use integer RMSNorm for final norm if enabled
-        if 0:
-            self.norm = RMSNormFusedInteger(
-                size=config.hidden_size,
-                eps=config.rms_norm_eps,
-            )
+        if INTEGER_MODE_ENABLED:
+                self.norm = RMSNormFusedInteger(
+                    size=config.hidden_size,
+                    eps=config.rms_norm_eps,
+                )
         else:
             from minisgl.layers import RMSNormFused
             self.norm = RMSNormFused(
@@ -123,18 +109,10 @@ class Qwen3ModelInteger(BaseOP):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
-        
-        if DEBUG_HIDDEN_STATES:
-            print(f"[Embedding] x range=[{x.min().item():.4f}, {x.max().item():.4f}], mean={x.mean().item():.6f}")
-        
+
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
-        
-        if DEBUG_HIDDEN_STATES:
-            print(f"[Final norm input] x range=[{x.min().item():.4f}, {x.max().item():.4f}]")
-            if residual is not None:
-                print(f"[Final norm input] residual range=[{residual.min().item():.4f}, {residual.max().item():.4f}]")
         
         return self.norm.forward(x, residual)[0]
 

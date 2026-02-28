@@ -103,14 +103,14 @@ def rmsnorm_q15_16_v2(
         
         # Step 2: Normalize to int16 (Q0.15)
         x_norm = x_row << (30 - max_pos)
-        x_norm = x_norm >> 15
+        x_norm = x_norm >> 16
         
         # Step 3: Compute sum of squares using normalized values
-        mean_sq = np.mean(x_norm * x_norm).astype(np.int32) << 1
+        mean_sq = np.mean(x_norm * x_norm).astype(np.int32) >> 1
         inv_sqrt = inverse_sqrt_q0_31(mean_sq + eps)
         
         # Step 5: Compute output
-        output[b] = (x_row.astype(np.int64) * inv_sqrt.astype(np.int64) >> max_pos).astype(np.int32)
+        output[b] = (x_row.astype(np.int64) * inv_sqrt.astype(np.int64) >> (max_pos + 2)).astype(np.int32)
     
     return output
 
@@ -152,10 +152,19 @@ def test_overflow_case():
 
 def test_normal_case():
     """Test with normal values."""
-    batch, hidden = 1, 3
+    batch, hidden = 9, 4096
     
     # x_float = np.random.randn(batch, hidden).astype(np.float32) * 0.5
-    x_float = np.array([[1.0, 2.0, 4.0]], dtype=np.float32).repeat(batch, axis=0)
+    # x_float = np.array([[1.0, 2.0, 4.0]], dtype=np.float32).repeat(batch, axis=0)
+    import glob, torch
+    debug_files = glob.glob('/tmp/fused_norm_debug_layer447_*.pt')
+    if not debug_files:
+        print("Warning: No debug file found for layer 447, skipping test")
+        return
+    
+    data = torch.load(debug_files[-1])
+    x_float = data['x'].float().cpu().numpy().astype(np.float32)
+    print(f"shape of x: {x_float.shape}, range: [{x_float.min():.4f}, {x_float.max():.4f}]")
     weight_float = np.ones(hidden, dtype=np.float32)
     
     x_q15_16 = float_to_q15_16(x_float)
@@ -171,9 +180,53 @@ def test_normal_case():
     
     diff = np.abs(out_ref - out_v2_float)
     print(f"Max diff: {diff.max():.6f}")
+    print(f"Max diff pos: {np.unravel_index(np.argmax(diff), diff.shape)}")
+    print(f"diff values at max diff pos: ref={out_ref[np.unravel_index(np.argmax(diff), diff.shape)]}, v2={out_v2_float[np.unravel_index(np.argmax(diff), diff.shape)]}")
 
     print(f"first row of output (float): {out_v2_float[0, :5]}")
     print(f"first row of reference (float): {out_ref[0, :5]}")
+    cos_sim = np.sum(out_v2_float * out_ref) / (np.linalg.norm(out_v2_float) * np.linalg.norm(out_ref))
+    print(f"Cosine similarity between V2 output and reference: {cos_sim:.6f}")
+
+
+def test_residual_case():
+    """Test with normal values."""
+    batch, hidden = 9, 4096
+    
+    # x_float = np.random.randn(batch, hidden).astype(np.float32) * 0.5
+    # x_float = np.array([[1.0, 2.0, 4.0]], dtype=np.float32).repeat(batch, axis=0)
+    import glob, torch
+    debug_files = glob.glob('/tmp/fused_norm_debug_layer447_*.pt')
+    if not debug_files:
+        print("Warning: No debug file found for layer 447, skipping test")
+        return
+    
+    data = torch.load(debug_files[-1])
+    x_float = (data['x'] + data['residual']).float().cpu().numpy().astype(np.float32)
+    # x_float = x_float[3:4, :]
+    print(f"shape of x: {x_float.shape}, range: [{x_float.min():.4f}, {x_float.max():.4f}]")
+    weight_float = np.ones(hidden, dtype=np.float32)
+    
+    x_q15_16 = float_to_q15_16(x_float)
+    weight_q15_16 = float_to_q15_16(weight_float)
+    
+    # Reference
+    rms = np.sqrt(np.mean(x_float ** 2, axis=-1, keepdims=True) + 1e-6)
+    out_ref = x_float / rms * weight_float
+    
+    # Test V2
+    out_v2 = rmsnorm_q15_16_v2(x_q15_16, weight_q15_16)
+    out_v2_float = q15_16_to_float(out_v2)
+    
+    diff = np.abs(out_ref - out_v2_float)
+    print(f"Max diff: {diff.max():.6f}")
+    print(f"Max diff pos: {np.unravel_index(np.argmax(diff), diff.shape)}")
+    print(f"diff values at max diff pos: ref={out_ref[np.unravel_index(np.argmax(diff), diff.shape)]}, v2={out_v2_float[np.unravel_index(np.argmax(diff), diff.shape)]}")
+
+    print(f"first row of output (float): {out_v2_float[0, :5]}")
+    print(f"first row of reference (float): {out_ref[0, :5]}")
+    cos_sim = np.sum(out_v2_float * out_ref) / (np.linalg.norm(out_v2_float) * np.linalg.norm(out_ref))
+    print(f"Cosine similarity between V2 output and reference: {cos_sim:.6f}")
 
 def test_inverse_sqrt():
     """Test inverse_sqrt_q0_31 function."""
@@ -192,10 +245,11 @@ if __name__ == "__main__":
     print("=" * 60)
     
     # print("\n1. Testing overflow case:")
-    test_overflow_case()
+    # test_overflow_case()
     
     # print("\n2. Testing normal case:")
     test_normal_case()
+    test_residual_case()
 
-    print("\n3. Testing inverse_sqrt function:")
-    test_inverse_sqrt()
+    # print("\n3. Testing inverse_sqrt function:")
+    # test_inverse_sqrt()
