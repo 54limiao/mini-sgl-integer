@@ -30,6 +30,13 @@ def resolve_auto_backend() -> str:
         return "fi"
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register("triton_int8")
+def create_triton_int8_backend(config: ModelConfig, kvcache: BaseKVCache):
+    from .triton_int8 import Int8Backend
+
+    return Int8Backend(config, kvcache)
+
+
 @SUPPORTED_ATTENTION_BACKENDS.register("fi")
 def create_fi_backend(config: ModelConfig, kvcache: BaseKVCache):
     from .fi import FlashInferBackend
