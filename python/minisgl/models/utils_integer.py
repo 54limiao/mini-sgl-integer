@@ -10,10 +10,14 @@ This module provides pseudo-quantized versions of MLP components that:
 This is for validating the integer-only MLP inference path.
 """
 
-import torch
+from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+import torch
+from minisgl.core import get_global_ctx
+from minisgl.distributed import get_tp_info
 from minisgl.layers import (
-    AttentionLayer,
     BaseOP,
     LinearColParallelMerged,
     LinearOProj,
@@ -21,10 +25,16 @@ from minisgl.layers import (
     LinearReplicated,
     LinearRowParallel,
     RMSNorm,
+    StateLessOP,
 )
 from minisgl.layers.activation_integer import silu_and_mul_fixed
+from minisgl.layers.rotary_integer import get_rope_integer
 from minisgl.models import ModelConfig
-from minisgl.utils import nvtx_annotate
+from minisgl.utils import div_even, nvtx_annotate
+
+if TYPE_CHECKING:
+    from minisgl.layers import RMSNorm as RMSNormType
+    from minisgl.models import RotaryConfig
 
 
 class GatedMLPInteger(BaseOP):
@@ -54,8 +64,54 @@ class GatedMLPInteger(BaseOP):
         return self.down_proj.forward(y)
 
 
+class AttentionLayerInteger(StateLessOP):
+    """Attention layer with pseudo-quantized RoPE."""
+
+    def __init__(
+        self,
+        layer_id: int,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        rotary_config: RotaryConfig,
+        q_norm: RMSNormType | None = None,
+        k_norm: RMSNormType | None = None,
+    ):
+        assert num_qo_heads % num_kv_heads == 0
+        self.layer_id = layer_id
+        self.head_dim = head_dim
+        tp_size = get_tp_info().size
+        self.num_qo_heads = div_even(num_qo_heads, tp_size)
+        self.num_kv_heads = div_even(num_kv_heads, tp_size)
+        self.qo_attn_dim = self.num_qo_heads * head_dim
+        self.kv_attn_dim = self.num_kv_heads * head_dim
+        # Use pseudo-quantized RoPE
+        self.rotary = get_rope_integer(
+            head_dim=head_dim,
+            rotary_dim=rotary_config.rotary_dim,
+            max_position=rotary_config.max_position,
+            base=rotary_config.base,
+            rope_scaling=tuple(rotary_config.scaling.items()) if rotary_config.scaling else None,
+        )
+        self.q_norm = q_norm
+        self.k_norm = k_norm
+
+    def forward(self, qkv: torch.Tensor) -> torch.Tensor:
+        ctx = get_global_ctx()
+        q, k, v = qkv.split([self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim], dim=-1)
+        if self.q_norm is not None:
+            self.q_norm.forward_inplace(q.view(-1, self.num_qo_heads, self.head_dim))
+        if self.k_norm is not None:
+            self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
+        # Apply pseudo-quantized RoPE
+        q, k = self.rotary.forward(ctx.batch.positions, q, k)
+        q = q.view(-1, self.num_qo_heads, self.head_dim)
+        o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
+        return o.view(-1, self.qo_attn_dim)
+
+
 class RopeAttnInteger(BaseOP):
-    """Attention with integer-only components."""
+    """Attention with pseudo-quantized RoPE."""
 
     def __init__(
         self,
@@ -80,7 +136,8 @@ class RopeAttnInteger(BaseOP):
         else:
             self.q_norm = None
             self.k_norm = None
-        self.attn = AttentionLayer(
+        # Use AttentionLayerInteger with pseudo-quantized RoPE
+        self.attn = AttentionLayerInteger(
             layer_id=layer_id,
             head_dim=head_dim,
             num_qo_heads=config.num_qo_heads,
@@ -103,4 +160,4 @@ class RopeAttnInteger(BaseOP):
         return self.o_proj.forward(o)
 
 
-__all__ = ["GatedMLPInteger", "RopeAttnInteger"]
+__all__ = ["GatedMLPInteger", "RopeAttnInteger", "AttentionLayerInteger"]

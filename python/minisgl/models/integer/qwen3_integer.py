@@ -37,6 +37,10 @@ MAX_INTEGER_LAYERS = int(os.environ.get("MINISGL_MAX_INT_LAYERS", "-1"))
 # Set MINISGL_INTEGER_MLP=1 to enable integer MLP
 INTEGER_MLP_ENABLED = os.environ.get("MINISGL_INTEGER_MLP", "0")
 
+# Environment variable to control integer RoPE
+# Set MINISGL_INTEGER_ROPE=1 to enable pseudo-quantized RoPE
+INTEGER_ROPE_ENABLED = os.environ.get("MINISGL_INTEGER_ROPE", "0")
+
 
 def _str_to_bool(s: str | None) -> bool:
     """Convert string to boolean."""
@@ -47,6 +51,7 @@ def _str_to_bool(s: str | None) -> bool:
 
 _INTEGER_MODE_ENABLED = _str_to_bool(INTEGER_MODE_ENABLED)
 _INTEGER_MLP_ENABLED = _str_to_bool(INTEGER_MLP_ENABLED)
+_INTEGER_ROPE_ENABLED = _str_to_bool(INTEGER_ROPE_ENABLED)
 
 
 class Qwen3DecoderLayerInteger(BaseOP):
@@ -62,8 +67,11 @@ class Qwen3DecoderLayerInteger(BaseOP):
         else:
             self.mlp = Qwen3MLP(config)
         
-        # Attention (currently always float, can be made integer later)
-        self.self_attn = Qwen3Attn(config, layer_id, has_qk_norm=True)
+        # Choose Attention implementation
+        if apply_to_this_layer and _INTEGER_ROPE_ENABLED:
+            self.self_attn = RopeAttnInteger(config, layer_id, has_qk_norm=True)
+        else:
+            self.self_attn = Qwen3Attn(config, layer_id, has_qk_norm=True)
 
         # Layernorm
         from minisgl.layers import RMSNormFused
@@ -152,4 +160,4 @@ class Qwen3ForCausalLMInteger(BaseLLMModel):
         return logits
 
 
-__all__ = ["Qwen3ForCausalLMInteger", "_INTEGER_MODE_ENABLED", "_INTEGER_MLP_ENABLED"]
+__all__ = ["Qwen3ForCausalLMInteger", "_INTEGER_MODE_ENABLED", "_INTEGER_MLP_ENABLED", "_INTEGER_ROPE_ENABLED"]
