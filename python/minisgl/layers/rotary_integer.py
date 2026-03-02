@@ -1,15 +1,3 @@
-"""
-Pseudo-quantized Rotary Embedding using Q15.16 fixed-point format.
-
-This module provides a pseudo-quantized version of RoPE that:
-1. Converts float inputs to Q15.16 fixed-point (int32)
-2. Applies RoPE using flashinfer (still float internally)
-3. Converts results back to Q15.16 fixed-point
-4. Returns as float
-
-This is for validating the integer-only RoPE inference path.
-"""
-
 from __future__ import annotations
 
 import functools
@@ -19,16 +7,11 @@ from typing import Any, Callable, Dict, Tuple
 import torch
 
 from minisgl.kernel.fixed_point import FIXED_POINT_SCALE, from_fixed, to_fixed
+from minisgl.kernel.fixed_point.hadamard_triton import fwht
 from minisgl.layers.base import StateLessOP
 
 
 class RotaryEmbeddingInteger(StateLessOP):
-    """
-    Pseudo-quantized Rotary Embedding using Q15.16 fixed-point format.
-    
-    Input: float tensor -> quantize to Q15.16 -> apply RoPE -> dequantize to float
-    """
-
     def __init__(
         self,
         head_size: int,
@@ -40,18 +23,14 @@ class RotaryEmbeddingInteger(StateLessOP):
         super().__init__()
         self.head_size = head_size
         assert rotary_dim == head_size
-        
-        # Compute inverse frequency (in float)
         inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         if post_process is not None:
             inv_freq = post_process(inv_freq)
-        
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
         sin = freqs.sin()
-        
-        # Buffer for cos/sin cache (stored in float, used directly)
+        # buffer, so don't load/save
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
         assert self.head_size in [64, 128, 256, 512]
 
@@ -103,6 +82,19 @@ class RotaryEmbeddingInteger(StateLessOP):
             cos_sin_cache=self._cos_sin_cache,
         )
         
+        # Step 3.5: Apply Fast Hadamard Transform along head_dim dimension
+        hadamard_scale = 1.0 / math.sqrt(self.head_size)
+        
+        # Apply Hadamard to query (reshape to 2D, transform, reshape back to 3D)
+        query_2d = query_3d.view(-1, self.head_size)
+        query_2d = fwht(query_2d.to(torch.float32), scale=hadamard_scale, inplace=True).to(torch.bfloat16)
+        query_3d = query_2d.view(batch_size, num_qo_heads, self.head_size)
+        
+        # Apply Hadamard to key (reshape to 2D, transform, reshape back to 3D)
+        key_2d = key_3d.view(-1, self.head_size)
+        key_2d = fwht(key_2d.to(torch.float32), scale=hadamard_scale, inplace=True).to(torch.bfloat16)
+        key_3d = key_2d.view(batch_size, num_kv_heads, self.head_size)
+        
         # Step 4: Quantize back to Q15.16 (simulate integer-only output)
         query_out_fixed = torch.clamp(
             torch.round(query_3d.to(torch.float32) * FIXED_POINT_SCALE), 
@@ -132,11 +124,9 @@ def _get_rope_integer(
     base: float,
     rope_scaling: Dict[str, Any] | None = None,
 ) -> RotaryEmbeddingInteger:
-    """Create a pseudo-quantized RotaryEmbeddingInteger instance."""
     if rope_scaling is None:
         return RotaryEmbeddingInteger(head_dim, rotary_dim, max_position, base)
-    
-    # Handle rope scaling (same as original)
+    # need to test some cases:
     match rope_scaling["rope_type"]:
         case "llama3":
             scaling_factor: float = rope_scaling["factor"]
@@ -145,6 +135,7 @@ def _get_rope_integer(
             original_max_position: int = rope_scaling["original_max_position_embeddings"]
 
             def post_process(inv_freq: torch.Tensor) -> torch.Tensor:
+                # no smooth if low_freq_factor == high_freq_factor
                 wave_len = 2 * math.pi / inv_freq
                 if low_freq_factor == high_freq_factor:
                     return torch.where(
@@ -176,7 +167,6 @@ def get_rope_integer(
     base: float,
     rope_scaling: Tuple[Tuple[str, Any], ...] | None = None,
 ) -> RotaryEmbeddingInteger:
-    """Get cached pseudo-quantized RoPE instance."""
     rope_map = dict(rope_scaling) if rope_scaling is not None else None
     t = torch.tensor([])
     if t.device == torch.device("meta"):
