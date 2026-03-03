@@ -37,6 +37,13 @@ def create_triton_int8_backend(config: ModelConfig, kvcache: BaseKVCache):
     return Int8Backend(config, kvcache)
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register("triton")
+def create_triton_backend(config: ModelConfig, kvcache: BaseKVCache):
+    from .triton import TritonBackend
+
+    return TritonBackend(config, kvcache)
+
+
 @SUPPORTED_ATTENTION_BACKENDS.register("fi")
 def create_fi_backend(config: ModelConfig, kvcache: BaseKVCache):
     from .fi import FlashInferBackend
