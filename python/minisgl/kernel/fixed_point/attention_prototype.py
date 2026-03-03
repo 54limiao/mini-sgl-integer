@@ -115,20 +115,14 @@ def apply_mul_shift(x: np.ndarray, multiplier: int, shift: int) -> np.ndarray:
 
 
 def quant_int8_per_tensor(x: np.ndarray) -> tuple[np.ndarray, int, int]:
-    """
-    Per-tensor symmetric int8 quantization of a Q15.16 int32 matrix.
-
-    Returns:
-      x_int8          : [rows, cols]  int8
-      multiplier, shift: int32 scale encoding,  actual_float = x_int8 * multiplier / 2^shift
-    """
-    max_abs_float = float(np.max(np.abs(x))) / FIXED_POINT_SCALE   # de-Q15.16
-    scale_fp = max(max_abs_float / 127.0, 1e-38)
-    multiplier, shift = fp32_to_multiplier_shift(scale_fp)
-    # x_int8 = round(x_q15_16 / (scale_fp * 2^16))
-    denom = float(multiplier) / (1 << shift) * FIXED_POINT_SCALE   # ≈ scale_fp * 2^16
-    x_int8 = np.clip(np.round(x.astype(np.float64) / denom), -127, 127).astype(np.int8)
-    return x_int8, multiplier, shift
+    max_abs = np.max(np.abs(x))
+    if max_abs == 0:
+        return np.zeros_like(x, dtype=np.int8), 1, 0
+    largest_exp2 = np.ceil(np.log2(max_abs + 1e-38))
+    shift = (31 - largest_exp2).astype(np.int32)
+    multiplier = np.minimum(max_abs * 2.0**shift, np.iinfo(np.int32).max).astype(np.int32)
+    quantized = np.round(x / max_abs * np.iinfo(np.int8).max).astype(np.int8)
+    return quantized, multiplier, shift + 7
 
 
 def attention_q15_16_int8(
@@ -138,7 +132,7 @@ def attention_q15_16_int8(
     mul_q: int, shift_q: int, # Q scale: actual = mul_q / 2^shift_q
     mul_k: int, shift_k: int, # K scale
     mul_v: int, shift_v: int, # V scale
-    sm_scale: float | None = None,
+    # sm_scale: float | None = None, # sm_scale is none, this scale can be implemented as q_norm weight scale or q_weight scale
 ) -> np.ndarray:              # [seq_len, head_dim]  Q15.16 int32
     """
     Fully-integer attention — no fp32 after quantization.
@@ -161,18 +155,14 @@ def attention_q15_16_int8(
       out = acc * scale_v   (since attn is Q0.16 and v_int8 * scale_v = v_float)
           = (acc * mul_v + round) >> shift_v                          (int32 Q15.16)
     """
-    if sm_scale is None:
-        sm_scale = q_int8.shape[-1] ** -0.5
-
     # ------------------------------------------------------------------ #
     # 1. QK^T  →  Q15.16 scores  (all integer)
     # ------------------------------------------------------------------ #
     dot = q_int8.astype(np.int32) @ k_int8.astype(np.int32).T         # [S, S] int32
 
-    # combined scale = scale_q * scale_k * sm_scale, then × 2^16 for Q15.16 output
-    combined = (float(mul_q) / (1 << shift_q)) * (float(mul_k) / (1 << shift_k)) * sm_scale
-    mul_c16, shift_c16 = fp32_to_multiplier_shift(combined * FIXED_POINT_SCALE)
-    scores_q15_16 = apply_mul_shift(dot, mul_c16, shift_c16).astype(np.int32)
+    combined_mul = (mul_q.astype(np.int64) * mul_k >> 32).astype(np.int32)
+    combined_shift = shift_q + shift_k - 32
+    scores_q15_16 = apply_mul_shift(dot, combined_mul, combined_shift - 16)  # [S, S] int32 in Q15.16
 
     # ------------------------------------------------------------------ #
     # 2. Softmax in Q15.16
@@ -224,13 +214,10 @@ def test_attention_q15_16_int8():
     # float32 reference
     out_ref = attention(q_f, k_f, v_f)
 
-    # quantize float → Q15.16, then per-tensor int8
-    q_int8, mq, shq = quant_int8_per_tensor(float_to_q15_16(q_f))
-    k_int8, mk, shk = quant_int8_per_tensor(float_to_q15_16(k_f))
-    v_int8, mv, shv = quant_int8_per_tensor(float_to_q15_16(v_f))
-    print(f"  Q scale: {mq} >> {shq}  ≈  {mq / (1 << shq):.6f}")
-    print(f"  K scale: {mk} >> {shk}  ≈  {mk / (1 << shk):.6f}")
-    print(f"  V scale: {mv} >> {shv}  ≈  {mv / (1 << shv):.6f}")
+    # quantize to per-tensor int8
+    q_int8, mq, shq = quant_int8_per_tensor(q_f * (head_dim ** -0.5))  # Apply attention scaling to q before quantization
+    k_int8, mk, shk = quant_int8_per_tensor(k_f)
+    v_int8, mv, shv = quant_int8_per_tensor(v_f)
 
     out_q = attention_q15_16_int8(q_int8, k_int8, v_int8, mq, shq, mk, shk, mv, shv)
     out_q_f = q15_16_to_float(out_q)
