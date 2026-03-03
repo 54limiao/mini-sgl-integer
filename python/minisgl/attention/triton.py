@@ -49,8 +49,13 @@ class TritonMetadata(BaseAttnMetadata):
     causal: bool = True
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
-        # For decode, last index is always the last token
-        return torch.arange(bs, device=self.kv_indptr.device)
+        if self.qo_indptr is not None:
+            # Prefill: output is packed [total_q_tokens, heads, dim].
+            # Return the index of the *last* query token per sequence.
+            return self.qo_indptr[1 : 1 + bs] - 1
+        else:
+            # Decode: output is [bs, heads, dim], one row per sequence.
+            return torch.arange(bs, device=self.kv_indptr.device)
 
 
 class TritonBackend(BaseAttnBackend):

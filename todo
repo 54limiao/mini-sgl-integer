@@ -8,8 +8,8 @@
 - modify r4 support
 
 
-          integer    w8a8     float
-gms8k     0.8469     0.8506   0.8916
+          integer    w8a8     float      kv_pertensor_int8
+gms8k     0.8469     0.8506   0.8916     0.8461
 
 evalscope eval \
  --model "Qwen3-8B" \
@@ -32,6 +32,5 @@ CUDA_VISIBLE_DEVICES=0 python -m minisgl --model "/workspace/lim42@xiaopeng.com/
 # integer-only
 MINISGL_INTEGER_MODE=1 MINISGL_MAX_INT_LAYERS=-1  CUDA_VISIBLE_DEVICES=0 python -m minisgl --model "/workspace/lim42@xiaopeng.com/github/quant_bench/data/models/Qwen/Qwen3-8B-r1r2-gptq-w8a8-dynamic" --shell
 
-MINISGL_INTEGER_ROPE=1 MINISGL_INTEGER_MLP=1 MINISGL_INTEGER_MODE=1 MINISGL_MAX_INT_LAYERS=-1  CUDA_VISIBLE_DEVICES=0 python -m minisgl --model "/workspace/lim42@xiaopeng.com/github/quant_bench/data/models/Qwen/Qwen3-8B-r1r2-gptq-w8a8-dynamic" --port 1919 --shell
-
+MINISGL_INTEGER_ROPE=1 MINISGL_INTEGER_MLP=1 MINISGL_INTEGER_MODE=1 MINISGL_MAX_INT_LAYERS=-1  CUDA_VISIBLE_DEVICES=0 python -m minisgl --model "/workspace/lim42@xiaopeng.com/github/quant_bench/data/models/Qwen/Qwen3-8B-r1r2-gptq-w8a8-dynamic" --port 1919 --shell --atten triton
 
