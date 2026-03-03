@@ -20,6 +20,10 @@ def q15_16_to_float(x: np.ndarray) -> np.ndarray:
     """Convert Q15.16 int32 to float."""
     return x.astype(np.float32) / FIXED_POINT_SCALE
 
+def q0_15_to_float(x: np.ndarray) -> np.ndarray:
+    """Convert Q0.15 int16 to float."""
+    return x.astype(np.float32) / 32768.0  # 2^15
+
 def cos_similarity(a, b):
     dot_product = np.dot(a, b)
     norm_a = np.linalg.norm(a)
@@ -52,10 +56,10 @@ def softmax_q15_16(x: np.ndarray) -> np.ndarray:
 
     Strategy (per row):
     1. Find row max for numerical stability.
-    2. Compute exp(x - max) using exp_q15_16.   result in Q0.16
+    2. Compute exp(x - max) using exp_q15_16.
     3. Sum the row exponentials.
     4. Compute 1/sum scaled to Q1.31: (2^31 - 1) // sum.
-    5. Multiply each exp by (1/sum) and shift right 15 → Q15.16 output.
+    5. Multiply each exp by (1/sum) and shift right 16 → Q0.15 output.
     """
     was_1d = x.ndim == 1
     if was_1d:
@@ -69,7 +73,7 @@ def softmax_q15_16(x: np.ndarray) -> np.ndarray:
         x_exp  = exp_q15_16(x_diff)
         x_sum  = np.sum(x_exp)
         inv    = ((1 << 31) - 1) // x_sum
-        out[i] = ((x_exp.astype(np.int64) * inv) >> 15).astype(np.int32)
+        out[i] = ((x_exp.astype(np.int64) * inv) >> 16).astype(np.int16)
 
     return out[0] if was_1d else out
 
@@ -155,31 +159,17 @@ def attention_q15_16_int8(
       out = acc * scale_v   (since attn is Q0.16 and v_int8 * scale_v = v_float)
           = (acc * mul_v + round) >> shift_v                          (int32 Q15.16)
     """
-    # ------------------------------------------------------------------ #
-    # 1. QK^T  →  Q15.16 scores  (all integer)
-    # ------------------------------------------------------------------ #
     dot = q_int8.astype(np.int32) @ k_int8.astype(np.int32).T         # [S, S] int32
 
     combined_mul = (mul_q.astype(np.int64) * mul_k >> 32).astype(np.int32)
     combined_shift = shift_q + shift_k - 32
     scores_q15_16 = apply_mul_shift(dot, combined_mul, combined_shift - 16)  # [S, S] int32 in Q15.16
 
-    # ------------------------------------------------------------------ #
-    # 2. Softmax in Q15.16
-    # ------------------------------------------------------------------ #
-    attn_q15_16 = softmax_q15_16(scores_q15_16)                        # [S, S] Q15.16
-
-    # ------------------------------------------------------------------ #
-    # 3. Weighted sum of V  →  Q15.16 output  (all integer)
-    #
-    #   attn_q15_16[i,j] = attn[i,j] * 2^16
-    #   v_int8[j,d]      = v_float[j,d] / scale_v  = v_float * 2^shift_v / mul_v
-    #   acc              = attn_q15_16 @ v_int8
-    #                    = output_float * 2^16 * 2^shift_v / mul_v
-    #   out_q15_16       = (acc * mul_v + round) >> shift_v
-    # ------------------------------------------------------------------ #
-    acc = attn_q15_16.astype(np.int64) @ v_int8.astype(np.int64)       # [S, D] int64
-    out_q15_16 = apply_mul_shift(acc, mul_v, shift_v).astype(np.int32)
+    attn_q0_15 = softmax_q15_16(scores_q15_16)                        # [S, S] Q0.15 int16
+    # attn_q0_15 represents attn_float * 2^15, so acc = Σ attn*2^15 * v_int8.
+    # out_float = acc * scale_v / 2^15; as Q15.16 → apply shift (shift_v - 1).
+    acc = attn_q0_15.astype(np.int32) @ v_int8.astype(np.int32)       # [S, D] int32
+    out_q15_16 = apply_mul_shift(acc, mul_v, shift_v - 1).astype(np.int32)
     return out_q15_16
 
 
@@ -192,12 +182,12 @@ def test_softmax_q15_16():
     softmax_fp = softmax(x)
     softmax_fixed = softmax_q15_16(float_to_q15_16(x))
     print("Softmax (float32):", softmax_fp)
-    print("Softmax (Q15.16):", q15_16_to_float(softmax_fixed))
+    print("Softmax (Q0.15):", q0_15_to_float(softmax_fixed))
 
     print(f"first 5 elements of float32 softmax: {softmax_fp.flatten()[:5]}")
-    print(f"first 5 elements of q15_16: {q15_16_to_float(softmax_fixed).flatten()[:5]}")
-    print("Cosine similarity:", cos_similarity(softmax_fp.flatten(), q15_16_to_float(softmax_fixed).flatten()))
-    print("MSE error:", mse_error(softmax_fp.flatten(), q15_16_to_float(softmax_fixed).flatten()))
+    print(f"first 5 elements of q15_16: {q0_15_to_float(softmax_fixed).flatten()[:5]}")
+    print("Cosine similarity:", cos_similarity(softmax_fp.flatten(), q0_15_to_float(softmax_fixed).flatten()))
+    print("MSE error:", mse_error(softmax_fp.flatten(), q0_15_to_float(softmax_fixed).flatten()))
 
 
 def test_attention_q15_16_int8():
