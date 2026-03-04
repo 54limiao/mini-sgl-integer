@@ -64,6 +64,45 @@ class TestQ15LayerFlow:
         diff = (out_q15_fp - out_fp).abs().max().item()
         assert diff < 0.02, f"RMSNorm Q15 API mismatch too large: {diff}"
 
+    def test_rmsnorm_q15_supports_3d(self):
+        if not torch.cuda.is_available():
+            return
+
+        x = torch.randn(3, 5, 64, device="cuda", dtype=torch.bfloat16)
+        x_q15 = to_fixed(x)
+
+        norm = RMSNormInteger(size=64, eps=1e-6)
+        norm.weight = torch.ones(64, device="cuda", dtype=torch.bfloat16)
+
+        out_q15 = norm.forward_q15(x_q15)
+        out_fp = norm.forward(x).to(torch.float32)
+        out_q15_fp = from_fixed(out_q15, torch.float32)
+
+        diff = (out_q15_fp - out_fp).abs().max().item()
+        assert out_q15.shape == x_q15.shape
+        assert out_q15.dtype == torch.int32
+        assert diff < 0.02, f"RMSNorm 3D Q15 mismatch too large: {diff}"
+
+    def test_rmsnorm_q15_supports_packed_last_dim(self):
+        if not torch.cuda.is_available():
+            return
+
+        batch, heads, head_dim = 3, 5, 64
+        x_3d = torch.randn(batch, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        x_packed_q15 = to_fixed(x_3d.reshape(batch, heads * head_dim))
+
+        norm = RMSNormInteger(size=head_dim, eps=1e-6)
+        norm.weight = torch.ones(head_dim, device="cuda", dtype=torch.bfloat16)
+
+        out_packed_q15 = norm.forward_q15(x_packed_q15)
+        out_packed_fp = from_fixed(out_packed_q15, torch.float32).reshape(batch, heads, head_dim)
+        out_ref_fp = norm.forward(x_3d).to(torch.float32)
+
+        diff = (out_packed_fp - out_ref_fp).abs().max().item()
+        assert out_packed_q15.shape == x_packed_q15.shape
+        assert out_packed_q15.dtype == torch.int32
+        assert diff < 0.02, f"RMSNorm packed-last-dim Q15 mismatch too large: {diff}"
+
     def test_fused_rmsnorm_q15_api_shapes(self):
         if not torch.cuda.is_available():
             return

@@ -172,36 +172,12 @@ class AttentionLayerInteger(StateLessOP):
         )
 
         if self.q_norm is not None:
-            q_flat = q_q15.view(-1, self.num_qo_heads, self.head_dim).reshape(-1, self.head_dim)
-            if hasattr(self.q_norm, "forward_q15"):
-                q_flat = self.q_norm.forward_q15(q_flat)
-            else:
-                q_flat = to_fixed(self.q_norm.forward(from_fixed(q_flat, torch.bfloat16)))
-            q_q15 = q_flat.view(-1, self.qo_attn_dim).contiguous()
+            q_q15 = self.q_norm.forward_q15(q_q15)
 
         if self.k_norm is not None:
-            k_flat = k_q15.view(-1, self.num_kv_heads, self.head_dim).reshape(-1, self.head_dim)
-            if hasattr(self.k_norm, "forward_q15"):
-                k_flat = self.k_norm.forward_q15(k_flat)
-            else:
-                k_flat = to_fixed(self.k_norm.forward(from_fixed(k_flat, torch.bfloat16)))
-            k_q15 = k_flat.view(-1, self.kv_attn_dim).contiguous()
+            k_q15 = self.k_norm.forward_q15(k_q15)
 
-        if hasattr(self.rotary, "forward_q15"):
-            q_q15, k_q15 = self.rotary.forward_q15(ctx.batch.positions, q_q15, k_q15)
-        else:
-            q_float, k_float = self.rotary.forward(
-                ctx.batch.positions,
-                from_fixed(q_q15, torch.bfloat16),
-                from_fixed(k_q15, torch.bfloat16),
-            )
-            q_q15 = to_fixed(q_float.view(-1, self.qo_attn_dim))
-            k_q15 = to_fixed(k_float)
-
-        if q_q15.ndim == 2:
-            q_q15 = q_q15.view(-1, self.num_qo_heads, self.head_dim)
-        elif q_q15.ndim != 3:
-            raise ValueError(f"Unexpected q_q15 ndim={q_q15.ndim}, expected 2 or 3")
+        q_q15, k_q15 = self.rotary.forward_q15(ctx.batch.positions, q_q15, k_q15)
 
         q = from_fixed(q_q15, torch.bfloat16)
         k = from_fixed(k_q15, torch.bfloat16)

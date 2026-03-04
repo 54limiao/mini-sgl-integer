@@ -6,8 +6,7 @@ from typing import Any, Callable, Dict, Tuple
 
 import torch
 
-from minisgl.kernel.fixed_point import FIXED_POINT_SCALE, from_fixed, to_fixed
-from minisgl.kernel.fixed_point.hadamard_triton import fwht
+from minisgl.kernel.fixed_point import TRIG_Q15_SCALE, from_fixed, rope_fwht_int_q15, to_fixed
 from minisgl.layers.base import StateLessOP
 
 
@@ -32,11 +31,12 @@ class RotaryEmbeddingInteger(StateLessOP):
         sin = freqs.sin()
         # buffer, so don't load/save
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
+        self._cos_sin_cache_q15 = torch.clamp(
+            torch.round(self._cos_sin_cache * TRIG_Q15_SCALE),
+            -(1 << 15),
+            (1 << 15) - 1,
+        ).to(torch.int32)
         assert self.head_size in [64, 128, 256, 512]
-
-        from flashinfer import apply_rope_with_cos_sin_cache_inplace
-
-        self.apply_rope_with_cos_sin_cache_inplace = apply_rope_with_cos_sin_cache_inplace
 
     def forward(
         self,
@@ -82,7 +82,8 @@ class RotaryEmbeddingInteger(StateLessOP):
 
         Returns:
             query_out_q15: [batch_size, num_qo_heads, head_size] in Q15.16 int32
-            key_out_q15: [batch_size, num_kv_heads * head_size] in Q15.16 int32
+            key_out_q15: [batch_size, num_kv_heads * head_size] in Q15.16 int32 when key input is 2D,
+                otherwise [batch_size, num_kv_heads, head_size]
         """
         if query_q15.dtype != torch.int32:
             raise TypeError(f"query_q15 must be int32 Q15.16, got {query_q15.dtype}")
@@ -90,54 +91,62 @@ class RotaryEmbeddingInteger(StateLessOP):
             raise TypeError(f"key_q15 must be int32 Q15.16, got {key_q15.dtype}")
 
         batch_size = query_q15.shape[0]
-        num_qo_heads = query_q15.shape[1] // self.head_size
-        num_kv_heads = key_q15.shape[1] // self.head_size
+        if key_q15.shape[0] != batch_size:
+            raise ValueError(
+                f"query/key batch mismatch: {batch_size} vs {key_q15.shape[0]}"
+            )
 
-        query_3d = (
-            (query_q15.to(torch.float32) / FIXED_POINT_SCALE)
-            .view(batch_size, num_qo_heads, self.head_size)
-            .to(torch.bfloat16)
-        )
-        key_3d = (
-            (key_q15.to(torch.float32) / FIXED_POINT_SCALE)
-            .view(batch_size, num_kv_heads, self.head_size)
-            .to(torch.bfloat16)
-        )
+        query_was_2d = query_q15.ndim == 2
+        key_was_2d = key_q15.ndim == 2
 
-        self.apply_rope_with_cos_sin_cache_inplace(
+        if query_q15.ndim == 2:
+            if query_q15.shape[1] % self.head_size != 0:
+                raise ValueError(
+                    f"query last dim must be divisible by head_size={self.head_size}, got {query_q15.shape[1]}"
+                )
+            num_qo_heads = query_q15.shape[1] // self.head_size
+            query_3d = query_q15.reshape(batch_size, num_qo_heads, self.head_size)
+        elif query_q15.ndim == 3:
+            if query_q15.shape[2] != self.head_size:
+                raise ValueError(
+                    f"query last dim must equal head_size={self.head_size}, got {query_q15.shape[2]}"
+                )
+            query_3d = query_q15
+        else:
+            raise ValueError(f"query_q15 must be 2D or 3D, got shape {tuple(query_q15.shape)}")
+
+        if key_q15.ndim == 2:
+            if key_q15.shape[1] % self.head_size != 0:
+                raise ValueError(
+                    f"key last dim must be divisible by head_size={self.head_size}, got {key_q15.shape[1]}"
+                )
+            num_kv_heads = key_q15.shape[1] // self.head_size
+            key_3d = key_q15.reshape(batch_size, num_kv_heads, self.head_size)
+        elif key_q15.ndim == 3:
+            if key_q15.shape[2] != self.head_size:
+                raise ValueError(
+                    f"key last dim must equal head_size={self.head_size}, got {key_q15.shape[2]}"
+                )
+            key_3d = key_q15
+        else:
+            raise ValueError(f"key_q15 must be 2D or 3D, got shape {tuple(key_q15.shape)}")
+
+        if positions.device != query_3d.device:
+            positions = positions.to(query_3d.device)
+        if self._cos_sin_cache_q15.device != query_3d.device:
+            self._cos_sin_cache_q15 = self._cos_sin_cache_q15.to(query_3d.device)
+
+        query_out_q15, key_out_q15 = rope_fwht_int_q15(
             positions=positions,
-            query=query_3d,
-            key=key_3d,
-            head_size=self.head_size,
-            cos_sin_cache=self._cos_sin_cache,
+            query_q15=query_3d,
+            key_q15=key_3d,
+            cos_sin_cache_q15=self._cos_sin_cache_q15,
         )
 
-        hadamard_scale = 1.0 / math.sqrt(self.head_size)
+        if key_was_2d:
+            key_out_q15 = key_out_q15.reshape(batch_size, -1)
 
-        query_2d = query_3d.view(-1, self.head_size)
-        query_2d = fwht(query_2d.to(torch.float32), scale=hadamard_scale, inplace=True).to(
-            torch.bfloat16
-        )
-        query_3d = query_2d.view(batch_size, num_qo_heads, self.head_size)
-
-        key_2d = key_3d.view(-1, self.head_size)
-        key_2d = fwht(key_2d.to(torch.float32), scale=hadamard_scale, inplace=True).to(
-            torch.bfloat16
-        )
-        key_3d = key_2d.view(batch_size, num_kv_heads, self.head_size)
-
-        query_out_q15 = torch.clamp(
-            torch.round(query_3d.to(torch.float32) * FIXED_POINT_SCALE),
-            -2**31,
-            2**31 - 1,
-        ).to(torch.int32)
-        key_out_q15 = torch.clamp(
-            torch.round(key_3d.to(torch.float32) * FIXED_POINT_SCALE),
-            -2**31,
-            2**31 - 1,
-        ).to(torch.int32)
-
-        return query_out_q15, key_out_q15.view(batch_size, -1)
+        return query_out_q15, key_out_q15
 
 
 def _get_rope_integer(

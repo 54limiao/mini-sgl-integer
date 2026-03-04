@@ -325,24 +325,45 @@ def rmsnorm_int_only_v2(
     Overflow-safe RMSNorm (Q15.16 format).
     
     Args:
-        x: Input tensor [batch, hidden_dim] (int32, Q15.16)
+        x: Input tensor [..., hidden_dim] or [..., n_heads * hidden_dim] (int32, Q15.16)
         weight: Weight tensor [hidden_dim] (int32, Q15.16)
         eps: Epsilon for numerical stability
     
     Returns:
-        Output tensor [batch, hidden_dim] (int32, Q15.16)
+        Output tensor with same shape as input (int32, Q15.16)
     """
     assert x.dtype == torch.int32, f"Expected int32 input, got {x.dtype}"
     assert weight.dtype == torch.int32, f"Expected int32 weight, got {weight.dtype}"
-    
-    batch, hidden_dim = x.shape
-    device = x.device
+
+    if x.ndim < 2:
+        raise ValueError(f"x must have at least 2 dims, got shape {tuple(x.shape)}")
+
+    if weight.ndim != 1:
+        raise ValueError(f"weight must be 1D, got shape {tuple(weight.shape)}")
+
+    hidden_dim = int(weight.shape[0])
+    last_dim = int(x.shape[-1])
+    if last_dim == hidden_dim:
+        x_work = x
+        packed_last_dim = False
+    elif last_dim % hidden_dim == 0:
+        num_groups = last_dim // hidden_dim
+        x_work = x.reshape(*x.shape[:-1], num_groups, hidden_dim)
+        packed_last_dim = True
+    else:
+        raise ValueError(
+            f"x last dim={last_dim} must equal hidden_dim={hidden_dim} "
+            f"or be a multiple of hidden_dim"
+        )
+
+    x_flat = x_work.reshape(-1, hidden_dim).contiguous()
+    batch = x_flat.shape[0]
     
     # Get LUT tables (lazy initialization)
     inv_sqrt_lut, debruijn_table = _get_lut_tables()
     
     # Allocate output
-    out = torch.empty_like(x)
+    out_flat = torch.empty_like(x_flat)
     
     # Convert eps to Q0.31 (eps = 1 for simplicity in integer)
     eps_int = 1
@@ -353,17 +374,20 @@ def rmsnorm_int_only_v2(
     
     grid = (batch,)
     rmsnorm_int_only_v2_kernel[grid](
-        x, weight, out,
+        x_flat, weight, out_flat,
         inv_sqrt_lut, debruijn_table,
-        x.stride(0), x.stride(1),
+        x_flat.stride(0), x_flat.stride(1),
         weight.stride(0),
-        out.stride(0), out.stride(1),
+        out_flat.stride(0), out_flat.stride(1),
         hidden_dim,
         eps=eps_int,
         BLOCK_SIZE=BLOCK_SIZE,
     )
-    
-    return out
+
+    out_work = out_flat.view_as(x_work)
+    if packed_last_dim:
+        return out_work.reshape_as(x)
+    return out_work
 
 
 def fused_add_rmsnorm_int_only_v2(
@@ -376,27 +400,55 @@ def fused_add_rmsnorm_int_only_v2(
     Fused add + RMSNorm for fixed-point (pure integer) - V2 overflow-safe.
     
     Args:
-        residual: Residual tensor [batch, hidden_dim] (int32, Q15.16)
-        x: Input tensor [batch, hidden_dim] (int32, Q15.16)
+        residual: Residual tensor [..., hidden_dim] or [..., n_heads * hidden_dim] (int32, Q15.16)
+        x: Input tensor [..., hidden_dim] or [..., n_heads * hidden_dim] (int32, Q15.16)
         weight: Weight tensor [hidden_dim] (int32, Q15.16)
         eps: Epsilon for numerical stability
     
     Returns:
-        (output, residual_out) tuple of int32 tensors (Q15.16)
+        (output, residual_out) tuple of int32 tensors (Q15.16), both with same shape as inputs
     """
     assert residual.dtype == torch.int32, f"Expected int32 residual, got {residual.dtype}"
     assert x.dtype == torch.int32, f"Expected int32 x, got {x.dtype}"
     assert weight.dtype == torch.int32, f"Expected int32 weight, got {weight.dtype}"
-    
-    batch, hidden_dim = x.shape
-    device = x.device
+
+    if x.ndim < 2:
+        raise ValueError(f"x must have at least 2 dims, got shape {tuple(x.shape)}")
+    if residual.shape != x.shape:
+        raise ValueError(
+            f"residual and x must have same shape, got {tuple(residual.shape)} vs {tuple(x.shape)}"
+        )
+
+    if weight.ndim != 1:
+        raise ValueError(f"weight must be 1D, got shape {tuple(weight.shape)}")
+
+    hidden_dim = int(weight.shape[0])
+    last_dim = int(x.shape[-1])
+    if last_dim == hidden_dim:
+        x_work = x
+        residual_work = residual
+        packed_last_dim = False
+    elif last_dim % hidden_dim == 0:
+        num_groups = last_dim // hidden_dim
+        x_work = x.reshape(*x.shape[:-1], num_groups, hidden_dim)
+        residual_work = residual.reshape(*residual.shape[:-1], num_groups, hidden_dim)
+        packed_last_dim = True
+    else:
+        raise ValueError(
+            f"x last dim={last_dim} must equal hidden_dim={hidden_dim} "
+            f"or be a multiple of hidden_dim"
+        )
+
+    x_flat = x_work.reshape(-1, hidden_dim).contiguous()
+    residual_flat = residual_work.reshape(-1, hidden_dim).contiguous()
+    batch = x_flat.shape[0]
     
     # Get LUT tables (lazy initialization)
     inv_sqrt_lut, debruijn_table = _get_lut_tables()
     
     # Allocate outputs
-    out = torch.empty_like(x)
-    residual_out = torch.empty_like(residual)
+    out_flat = torch.empty_like(x_flat)
+    residual_out_flat = torch.empty_like(residual_flat)
     
     # Convert eps
     eps_int = 1
@@ -407,16 +459,20 @@ def fused_add_rmsnorm_int_only_v2(
     
     grid = (batch,)
     fused_add_rmsnorm_int_only_v2_kernel[grid](
-        residual, x, weight, out, residual_out,
+        residual_flat, x_flat, weight, out_flat, residual_out_flat,
         inv_sqrt_lut, debruijn_table,
-        residual.stride(0), residual.stride(1),
+        residual_flat.stride(0), residual_flat.stride(1),
         weight.stride(0),
         hidden_dim,
         eps=eps_int,
         BLOCK_SIZE=BLOCK_SIZE,
     )
-    
-    return out, residual_out
+
+    out_work = out_flat.view_as(x_work)
+    residual_out_work = residual_out_flat.view_as(residual_work)
+    if packed_last_dim:
+        return out_work.reshape_as(x), residual_out_work.reshape_as(residual)
+    return out_work, residual_out_work
 
 
 # ============================================================================

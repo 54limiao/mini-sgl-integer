@@ -4,6 +4,9 @@ Uses Q15.16 format (32-bit signed integer with 16 fractional bits).
 """
 
 from .q15_tensor import FIXED_POINT_SCALE, Q15Tensor, assert_q15, from_fixed, to_fixed
+from .rope_int import TRIG_Q15_SCALE, rope_int_q15
+from .fwht_int import fwht_int_q15
+from .rope_fwht_int import rope_fwht_int_q15
 
 
 # V1: Original implementation (may overflow with large values)
@@ -21,6 +24,10 @@ __all__ = [
     "assert_q15",
     "to_fixed",
     "from_fixed",
+    "TRIG_Q15_SCALE",
+    "rope_int_q15",
+    "fwht_int_q15",
+    "rope_fwht_int_q15",
     # V1
     "rmsnorm_int_only",
     "fused_add_rmsnorm_int_only",
