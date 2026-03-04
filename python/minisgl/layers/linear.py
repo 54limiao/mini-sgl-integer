@@ -42,7 +42,10 @@ class _LinearTPImpl(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Check if this is a quantized layer (int8 weight with weight_scale)
         if self.weight.dtype == torch.int8 and hasattr(self, "weight_scale"):
-            return _get_w8a8_quantizer().apply_weights(self, x, self.bias)
+            quantizer = _get_w8a8_quantizer()
+            if x.dtype == torch.int32:
+                return quantizer.apply_weights_q15(self, x, self.bias)
+            return quantizer.apply_weights(self, x, self.bias)
         return F.linear(x, self.weight, self.bias)
 
 
@@ -116,7 +119,11 @@ class LinearOProj(_LinearTPImpl):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Check if this is a quantized layer
         if self.weight.dtype == torch.int8 and hasattr(self, "weight_scale"):
-            y = _get_w8a8_quantizer().apply_weights(self, x, self.bias)
+            quantizer = _get_w8a8_quantizer()
+            if x.dtype == torch.int32:
+                y = quantizer.apply_weights_q15(self, x, self.bias)
+            else:
+                y = quantizer.apply_weights(self, x, self.bias)
         else:
             y = F.linear(x, self.weight, self.bias)
         if self._tp_size > 1:
@@ -141,7 +148,11 @@ class LinearRowParallel(_LinearTPImpl):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Check if this is a quantized layer
         if self.weight.dtype == torch.int8 and hasattr(self, "weight_scale"):
-            y = _get_w8a8_quantizer().apply_weights(self, x, self.bias)
+            quantizer = _get_w8a8_quantizer()
+            if x.dtype == torch.int32:
+                y = quantizer.apply_weights_q15(self, x, self.bias)
+            else:
+                y = quantizer.apply_weights(self, x, self.bias)
         else:
             y = F.linear(x, self.weight, self.bias)
         if self._tp_size > 1:

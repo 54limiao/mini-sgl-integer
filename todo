@@ -27,7 +27,12 @@ CUDA_VISIBLE_DEVICES=0 python -m minisgl --model "/workspace/lim42@xiaopeng.com/
 # wa8a8
 CUDA_VISIBLE_DEVICES=0 python -m minisgl --model "/workspace/lim42@xiaopeng.com/github/quant_bench/data/models/Qwen/Qwen3-8B-r1r2-gptq-w8a8-dynamic" --shell
 # integer-only
-MINISGL_INTEGER_MODE=1 MINISGL_MAX_INT_LAYERS=-1  CUDA_VISIBLE_DEVICES=0 python -m minisgl --model "/workspace/lim42@xiaopeng.com/github/quant_bench/data/models/Qwen/Qwen3-8B-r1r2-gptq-w8a8-dynamic" --shell
+MINISGL_INTEGER_MODE=1 CUDA_VISIBLE_DEVICES=0 python -m minisgl --model "/workspace/lim42@xiaopeng.com/github/quant_bench/data/models/Qwen/Qwen3-8B-r1r2-gptq-w8a8-dynamic" --shell
 
-MINISGL_INTEGER_ROPE=1 MINISGL_INTEGER_MLP=1 MINISGL_INTEGER_MODE=1 MINISGL_MAX_INT_LAYERS=-1  CUDA_VISIBLE_DEVICES=0 python -m minisgl --model "/workspace/lim42@xiaopeng.com/github/quant_bench/data/models/Qwen/Qwen3-8B-r1r2-gptq-w8a8-dynamic" --port 1919 --shell --atten triton_int8
+MINISGL_INTEGER_MODE=1 CUDA_VISIBLE_DEVICES=0 python -m minisgl --model "/workspace/lim42@xiaopeng.com/github/quant_bench/data/models/Qwen/Qwen3-8B-r1r2-gptq-w8a8-dynamic" --port 1919 --shell --atten triton_int8
 
+M1 数据契约：定义“层间统一 torch.int32(Q15.16)”ABI，只允许 3 个边界转换：Embedding→Q15、Q15↔Attention、Q15→LMHead(bf16)。
+M2 Linear 主改造：在 w8a8_int8.py 把 apply_weights 改为 Q15 in / Q15 out，int8_scaled_mm 后做整数 requant（mul+shift）得到 int32 Q15。
+M3 Integer 算子原生化：在 norm_integer.py 与 activation_integer.py 去掉内部 to_fixed/from_fixed，直接吃/吐 int32 Q15。
+M4 模型流重连：在 qwen3_integer.py 让 residual 主路径保持 Q15；调用 attention 前一次性反量化到 bf16，attention 输出再量化回 Q15。
+M5 输出边界：最后仅在 lm_head 前做一次 Q15→bf16（logits 保持现有浮点接口），满足你“最终输出反量化到 bf16”。

@@ -1,9 +1,9 @@
 """
-Qwen3 model with integer-only RMSNorm and MLP.
+Qwen3 model with integer-first operator pipeline.
 
-This is a variant of Qwen3 that uses integer-only components while keeping
-the rest of the computation in floating point. Useful for validating the
-integer inference path.
+This integer model does not load float fallback operators.
+Attention currently remains a float island at runtime (Q15<->bf16 bridge),
+while all other supported blocks run through integer modules.
 """
 
 from __future__ import annotations
@@ -13,13 +13,12 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 from minisgl.core import get_global_ctx
+from minisgl.kernel.fixed_point import from_fixed, to_fixed
 from minisgl.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from minisgl.layers.norm_integer import RMSNormFusedInteger
 from minisgl.utils import nvtx_annotate
 
 from ..base import BaseLLMModel
-from ..utils import GatedMLP as Qwen3MLP
-from ..utils import RopeAttn as Qwen3Attn
 from ..utils_integer import GatedMLPInteger, RopeAttnInteger
 
 if TYPE_CHECKING:
@@ -45,61 +44,63 @@ class Qwen3DecoderLayerInteger(BaseOP):
     """Qwen3 decoder layer with integer-only components."""
 
     def __init__(self, config: ModelConfig, layer_id: int):
-        # Choose MLP implementation (single switch: MINISGL_INTEGER_MODE)
-        if _INTEGER_MODE_ENABLED:
-            self.mlp = GatedMLPInteger(config)
-        else:
-            self.mlp = Qwen3MLP(config)
+        self.mlp = GatedMLPInteger(config)
+        self.self_attn = RopeAttnInteger(config, layer_id, has_qk_norm=True)
 
-        # Choose Attention implementation (single switch: MINISGL_INTEGER_MODE)
-        if _INTEGER_MODE_ENABLED:
-            self.self_attn = RopeAttnInteger(config, layer_id, has_qk_norm=True)
-        else:
-            self.self_attn = Qwen3Attn(config, layer_id, has_qk_norm=True)
-
-        # Layernorm
-        from minisgl.layers import RMSNormFused
-        self.input_layernorm = RMSNormFused(
+        self.input_layernorm = RMSNormFusedInteger(
             size=config.hidden_size,
             eps=config.rms_norm_eps,
         )
-        self.post_attention_layernorm = RMSNormFused(
+        self.post_attention_layernorm = RMSNormFusedInteger(
             size=config.hidden_size,
             eps=config.rms_norm_eps,
         )
-
-        # Apply integer RMSNorm if enabled (single switch: MINISGL_INTEGER_MODE)
-        if _INTEGER_MODE_ENABLED:
-            self.input_layernorm = RMSNormFusedInteger(
-                size=config.hidden_size,
-                eps=config.rms_norm_eps,
-            )
-            self.post_attention_layernorm = RMSNormFusedInteger(
-                size=config.hidden_size,
-                eps=config.rms_norm_eps,
-            )
 
         self._layer_id = layer_id
+
+    @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
+    def forward_q15(
+        self,
+        x_q15: torch.Tensor,
+        residual_q15: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if x_q15.dtype != torch.int32:
+            raise TypeError(f"x_q15 must be int32 Q15.16, got {x_q15.dtype}")
+        if residual_q15 is not None and residual_q15.dtype != torch.int32:
+            raise TypeError(f"residual_q15 must be int32 Q15.16, got {residual_q15.dtype}")
+
+        x_q15, residual_q15 = self.input_layernorm.forward_q15(x_q15, residual_q15)
+
+        x_attn = from_fixed(x_q15, torch.bfloat16)
+        x_attn = self.self_attn.forward(x_attn)
+        x_q15 = to_fixed(x_attn)
+
+        x_q15, residual_q15 = self.post_attention_layernorm.forward_q15(x_q15, residual_q15)
+
+        x_q15 = self.mlp.forward_q15(x_q15)
+
+        return x_q15, residual_q15
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x, residual = self.input_layernorm.forward(x, residual)
-
-        x = self.self_attn.forward(x)
-
-        x, residual = self.post_attention_layernorm.forward(x, residual)
-
-        x = self.mlp.forward(x)
-
-        return x, residual
+        x_q15 = to_fixed(x)
+        residual_q15 = to_fixed(residual) if residual is not None else None
+        out_q15, residual_out_q15 = self.forward_q15(x_q15, residual_q15)
+        return from_fixed(out_q15, x.dtype), from_fixed(residual_out_q15, x.dtype)
 
 
 class Qwen3ModelInteger(BaseOP):
     """Qwen3 model with integer-only components."""
 
     def __init__(self, config: ModelConfig):
+        if not _INTEGER_MODE_ENABLED:
+            raise RuntimeError(
+                "Qwen3ForCausalLMInteger requires MINISGL_INTEGER_MODE=1. "
+                "Float fallback ops have been removed from qwen3_integer.py."
+            )
+
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -108,21 +109,21 @@ class Qwen3ModelInteger(BaseOP):
             [Qwen3DecoderLayerInteger(config, layer_id) for layer_id in range(config.num_layers)]
         )
 
-        # Final norm
-        from minisgl.layers import RMSNormFused
-        self.norm = RMSNormFused(
+        self.norm = RMSNormFusedInteger(
             size=config.hidden_size,
             eps=config.rms_norm_eps,
         )
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
+        x_q15 = to_fixed(x)
+        residual_q15: torch.Tensor | None = None
 
-        residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
-            x, residual = layer.forward(x, residual)
-        
-        return self.norm.forward(x, residual)[0]
+            x_q15, residual_q15 = layer.forward_q15(x_q15, residual_q15)
+
+        x_q15, _ = self.norm.forward_q15(x_q15, residual_q15)
+        return from_fixed(x_q15, x.dtype)
 
 
 class Qwen3ForCausalLMInteger(BaseLLMModel):

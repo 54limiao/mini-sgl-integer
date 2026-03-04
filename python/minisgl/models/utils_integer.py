@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from minisgl.core import get_global_ctx
+from minisgl.kernel.fixed_point import from_fixed, to_fixed
 from minisgl.distributed import get_tp_info
 from minisgl.layers import (
     BaseOP,
@@ -27,7 +28,7 @@ from minisgl.layers import (
     RMSNorm,
     StateLessOP,
 )
-from minisgl.layers.activation_integer import silu_and_mul_fixed
+from minisgl.layers.activation_integer import silu_and_mul_fixed, silu_and_mul_q15
 from minisgl.layers.rotary_integer import get_rope_integer
 from minisgl.models import ModelConfig
 from minisgl.utils import div_even, nvtx_annotate
@@ -62,6 +63,28 @@ class GatedMLPInteger(BaseOP):
         y = self.act_fn(gate_up)
         del gate_up
         return self.down_proj.forward(y)
+
+    def forward_q15(self, x_q15: torch.Tensor) -> torch.Tensor:
+        if x_q15.dtype != torch.int32:
+            raise TypeError(f"x_q15 must be int32 Q15.16, got {x_q15.dtype}")
+
+        gate_up_is_int8 = (
+            getattr(self.gate_up_proj, "weight", None) is not None
+            and self.gate_up_proj.weight.dtype == torch.int8
+            and hasattr(self.gate_up_proj, "weight_scale")
+        )
+        down_proj_is_int8 = (
+            getattr(self.down_proj, "weight", None) is not None
+            and self.down_proj.weight.dtype == torch.int8
+            and hasattr(self.down_proj, "weight_scale")
+        )
+
+        if not gate_up_is_int8 or not down_proj_is_int8:
+            return to_fixed(self.forward(from_fixed(x_q15, torch.bfloat16)))
+
+        gate_up_q15 = self.gate_up_proj.forward(x_q15)
+        y_q15 = silu_and_mul_q15(gate_up_q15)
+        return self.down_proj.forward(y_q15)
 
 
 class AttentionLayerInteger(StateLessOP):
@@ -200,6 +223,13 @@ class RopeAttnInteger(BaseOP):
         del x
         o = self.attn.forward(qkv)
         return self.o_proj.forward(o)
+
+    def forward_q15(self, x_q15: torch.Tensor) -> torch.Tensor:
+        if x_q15.dtype != torch.int32:
+            raise TypeError(f"x_q15 must be int32 Q15.16, got {x_q15.dtype}")
+        x = from_fixed(x_q15, torch.bfloat16)
+        out = self.forward(x)
+        return to_fixed(out)
 
 
 __all__ = [

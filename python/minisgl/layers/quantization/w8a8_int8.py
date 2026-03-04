@@ -17,6 +17,8 @@ from typing import Callable, Optional
 import torch
 from torch.nn import Parameter
 
+from minisgl.kernel.fixed_point import FIXED_POINT_SCALE, assert_q15, from_fixed, to_fixed
+
 # sgl_kernel import is deferred to avoid CUDA initialization at module load time
 _HAS_INT8_KERNEL = None
 
@@ -67,6 +69,36 @@ def per_token_quant_int8(x: torch.Tensor):
     x_q = x_q.view(orig_shape)
     scales = x_scale.view(orig_shape[:-1] + (1,))
 
+    return x_q, scales
+
+
+def per_token_quant_int8_from_q15(x_q15: torch.Tensor):
+    """Per-token quantization from Q15.16 int32 to int8.
+
+    Args:
+        x_q15: Input tensor in Q15.16 int32.
+
+    Returns:
+        x_q: Quantized int8 tensor.
+        scales: Per-token scales in float32 (real-value scale for int8 dequant).
+    """
+    assert_q15(x_q15, "x_q15")
+
+    orig_shape = x_q15.shape
+    x_2d = x_q15.view(-1, x_q15.shape[-1])
+
+    x_abs_max_q15 = x_2d.abs().amax(dim=1, keepdim=True).to(torch.int32)
+    x_abs_max_q15 = torch.clamp(x_abs_max_q15, min=1)
+
+    x_q = torch.round(
+        (x_2d.to(torch.float32) * 127.0) / x_abs_max_q15.to(torch.float32)
+    ).to(torch.int32)
+    x_q = torch.clamp(x_q, -128, 127).to(torch.int8)
+
+    scales = x_abs_max_q15.to(torch.float32) / (127.0 * float(FIXED_POINT_SCALE))
+
+    x_q = x_q.view(orig_shape)
+    scales = scales.view(orig_shape[:-1] + (1,))
     return x_q, scales
 
 
@@ -174,6 +206,47 @@ class W8A8Int8LinearMethod:
                 output = output + bias
 
         return output
+
+    def apply_weights_q15(
+        self,
+        layer: torch.nn.Module,
+        x_q15: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply W8A8 quantized linear with Q15.16 int32 input/output."""
+        assert_q15(x_q15, "x_q15")
+
+        x_q_int8, x_scale = per_token_quant_int8_from_q15(x_q15)
+        x_q_2d = x_q_int8.view(-1, x_q_int8.shape[-1])
+        x_scale_2d = x_scale.view(-1, 1)
+
+        weight = layer.weight
+        weight_scale = layer.weight_scale
+
+        bias_fp32 = None
+        if bias is not None:
+            if bias.dtype == torch.int32:
+                bias_fp32 = from_fixed(bias, dtype=torch.float32)
+            else:
+                bias_fp32 = bias.to(torch.float32)
+
+        if _has_int8_kernel():
+            bias_kernel = bias_fp32.to(torch.bfloat16) if bias_fp32 is not None else None
+            output_fp32 = _get_int8_scaled_mm()(
+                x_q_2d,
+                weight.t(),
+                x_scale_2d,
+                weight_scale.to(torch.float32),
+                out_dtype=torch.bfloat16,
+                bias=bias_kernel,
+            ).to(torch.float32)
+        else:
+            weight_float = weight.to(torch.float32) * weight_scale.to(torch.float32)
+            output_fp32 = torch.matmul(x_q_2d.to(torch.float32) * x_scale_2d, weight_float)
+            if bias_fp32 is not None:
+                output_fp32 = output_fp32 + bias_fp32
+
+        return to_fixed(output_fp32)
 
 
 class W8A8Int8MoEMethod:
