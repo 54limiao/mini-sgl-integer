@@ -27,19 +27,8 @@ if TYPE_CHECKING:
 
 
 # Environment variable to control integer mode
-# Set MINISGL_INTEGER_MODE=1 to enable integer RMSNorm
+# Set MINISGL_INTEGER_MODE=1 to enable integer ops (RMSNorm/MLP/RoPE-Attn)
 INTEGER_MODE_ENABLED = os.environ.get("MINISGL_INTEGER_MODE", "0")
-
-# Max layers to apply integer mode (-1 for all)
-MAX_INTEGER_LAYERS = int(os.environ.get("MINISGL_MAX_INT_LAYERS", "-1"))
-
-# Environment variable to control integer MLP
-# Set MINISGL_INTEGER_MLP=1 to enable integer MLP
-INTEGER_MLP_ENABLED = os.environ.get("MINISGL_INTEGER_MLP", "0")
-
-# Environment variable to control integer RoPE
-# Set MINISGL_INTEGER_ROPE=1 to enable pseudo-quantized RoPE
-INTEGER_ROPE_ENABLED = os.environ.get("MINISGL_INTEGER_ROPE", "0")
 
 
 def _str_to_bool(s: str | None) -> bool:
@@ -50,25 +39,20 @@ def _str_to_bool(s: str | None) -> bool:
 
 
 _INTEGER_MODE_ENABLED = _str_to_bool(INTEGER_MODE_ENABLED)
-_INTEGER_MLP_ENABLED = _str_to_bool(INTEGER_MLP_ENABLED)
-_INTEGER_ROPE_ENABLED = _str_to_bool(INTEGER_ROPE_ENABLED)
 
 
 class Qwen3DecoderLayerInteger(BaseOP):
     """Qwen3 decoder layer with integer-only components."""
 
     def __init__(self, config: ModelConfig, layer_id: int):
-        # Check if we should apply integer/hybrid mode to this layer
-        apply_to_this_layer = MAX_INTEGER_LAYERS < 0 or layer_id < MAX_INTEGER_LAYERS
-        
-        # Choose MLP implementation
-        if apply_to_this_layer and _INTEGER_MLP_ENABLED:
+        # Choose MLP implementation (single switch: MINISGL_INTEGER_MODE)
+        if _INTEGER_MODE_ENABLED:
             self.mlp = GatedMLPInteger(config)
         else:
             self.mlp = Qwen3MLP(config)
-        
-        # Choose Attention implementation
-        if apply_to_this_layer and _INTEGER_ROPE_ENABLED:
+
+        # Choose Attention implementation (single switch: MINISGL_INTEGER_MODE)
+        if _INTEGER_MODE_ENABLED:
             self.self_attn = RopeAttnInteger(config, layer_id, has_qk_norm=True)
         else:
             self.self_attn = Qwen3Attn(config, layer_id, has_qk_norm=True)
@@ -84,8 +68,8 @@ class Qwen3DecoderLayerInteger(BaseOP):
             eps=config.rms_norm_eps,
         )
 
-        # Apply integer RMSNorm if enabled
-        if apply_to_this_layer and _INTEGER_MODE_ENABLED:
+        # Apply integer RMSNorm if enabled (single switch: MINISGL_INTEGER_MODE)
+        if _INTEGER_MODE_ENABLED:
             self.input_layernorm = RMSNormFusedInteger(
                 size=config.hidden_size,
                 eps=config.rms_norm_eps,
@@ -160,4 +144,4 @@ class Qwen3ForCausalLMInteger(BaseLLMModel):
         return logits
 
 
-__all__ = ["Qwen3ForCausalLMInteger", "_INTEGER_MODE_ENABLED", "_INTEGER_MLP_ENABLED", "_INTEGER_ROPE_ENABLED"]
+__all__ = ["Qwen3ForCausalLMInteger", "_INTEGER_MODE_ENABLED"]
