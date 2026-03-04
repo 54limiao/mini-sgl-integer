@@ -6,7 +6,7 @@ Simplified and self-contained for mini-sglang.
 
 Key features:
 - Weight: int8, per-channel static quantization
-- Activation: int8, per-token dynamic quantization
+- Activation: int8, per-token dynamic quantization (or static per-tensor when input_scale exists)
 - Computation: int8_scaled_mm kernel
 """
 
@@ -72,6 +72,35 @@ def per_token_quant_int8(x: torch.Tensor):
     return x_q, scales
 
 
+def per_tensor_quant_int8_static(x: torch.Tensor, input_scale: torch.Tensor):
+    """Per-tensor static quantization to int8 using checkpoint-provided input_scale."""
+    orig_shape = x.shape
+    x_2d = x.view(-1, x.shape[-1])
+
+    scale = input_scale.to(device=x.device, dtype=torch.float32)
+    if scale.numel() > 1:
+        scale = scale.max()
+    scale = torch.clamp(scale, min=1e-10)
+
+    x_q = torch.round(x_2d / scale).to(torch.int32)
+    x_q = torch.clamp(x_q, -128, 127).to(torch.int8)
+
+    scales = scale.view(1, 1).repeat(x_2d.shape[0], 1)
+
+    x_q = x_q.view(orig_shape)
+    scales = scales.view(orig_shape[:-1] + (1,))
+    return x_q, scales
+
+
+def _get_static_input_scale(layer: torch.nn.Module) -> Optional[torch.Tensor]:
+    input_scale = getattr(layer, "input_scale", None)
+    if input_scale is None or not isinstance(input_scale, torch.Tensor):
+        return None
+    if input_scale.numel() == 0:
+        return None
+    return input_scale
+
+
 def per_token_quant_int8_from_q15(x_q15: torch.Tensor):
     """Per-token quantization from Q15.16 int32 to int8.
 
@@ -107,7 +136,7 @@ class W8A8Int8LinearMethod:
     Linear method for W8A8 INT8 quantization.
 
     - Weight: static, per-channel, symmetric
-    - Activation: dynamic, per-token, symmetric
+    - Activation: dynamic per-token (default) or static per-tensor with input_scale
     """
 
     def __init__(self):
@@ -175,12 +204,15 @@ class W8A8Int8LinearMethod:
         Returns:
             Output tensor
         """
-        # Dynamic per-token quantization of activation
-        x_q, x_scale = per_token_quant_int8(x)
+        input_scale = _get_static_input_scale(layer)
+        if input_scale is not None:
+            x_q, x_scale = per_tensor_quant_int8_static(x, input_scale)
+        else:
+            x_q, x_scale = per_token_quant_int8(x)
 
         # Reshape for matmul
-        x_q_2d = x_q.view(-1, x_q.shape[-1])
-        x_scale_2d = x_scale.view(-1, 1)
+        x_q_2d = x_q.view(-1, x_q.shape[-1]).contiguous()
+        x_scale_2d = x_scale.view(-1, 1).contiguous()
 
         # Get weight and scale
         # Weight is stored as [out_features, in_features]
@@ -201,7 +233,7 @@ class W8A8Int8LinearMethod:
             )
         else:
             weight_float = weight.to(x.dtype) * weight_scale.to(x.dtype)
-            output = torch.matmul(x_q_2d.to(x.dtype) * x_scale_2d.to(x.dtype), weight_float)
+            output = torch.matmul(x_q_2d.to(x.dtype) * x_scale_2d.to(x.dtype), weight_float.t())
             if bias is not None:
                 output = output + bias
 
@@ -216,9 +248,14 @@ class W8A8Int8LinearMethod:
         """Apply W8A8 quantized linear with Q15.16 int32 input/output."""
         assert_q15(x_q15, "x_q15")
 
-        x_q_int8, x_scale = per_token_quant_int8_from_q15(x_q15)
-        x_q_2d = x_q_int8.view(-1, x_q_int8.shape[-1])
-        x_scale_2d = x_scale.view(-1, 1)
+        input_scale = _get_static_input_scale(layer)
+        if input_scale is not None:
+            x_fp32 = from_fixed(x_q15, dtype=torch.float32)
+            x_q_int8, x_scale = per_tensor_quant_int8_static(x_fp32, input_scale)
+        else:
+            x_q_int8, x_scale = per_token_quant_int8_from_q15(x_q15)
+        x_q_2d = x_q_int8.view(-1, x_q_int8.shape[-1]).contiguous()
+        x_scale_2d = x_scale.view(-1, 1).contiguous()
 
         weight = layer.weight
         weight_scale = layer.weight_scale
@@ -242,7 +279,7 @@ class W8A8Int8LinearMethod:
             ).to(torch.float32)
         else:
             weight_float = weight.to(torch.float32) * weight_scale.to(torch.float32)
-            output_fp32 = torch.matmul(x_q_2d.to(torch.float32) * x_scale_2d, weight_float)
+            output_fp32 = torch.matmul(x_q_2d.to(torch.float32) * x_scale_2d, weight_float.t())
             if bias_fp32 is not None:
                 output_fp32 = output_fp32 + bias_fp32
 

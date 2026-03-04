@@ -82,16 +82,17 @@ class BaseOP:
                     state_dict, prefix=_concat_prefix(prefix, name), _internal=True
                 )
 
-        # Handle additional quantization parameters (e.g., weight_scale)
+        # Handle additional quantization parameters (e.g., weight_scale/input_scale)
         prefix_with_dot = prefix + "." if prefix else ""
+        quant_param_names = ("weight_scale", "input_scale", "input_zero_point")
         for key in list(state_dict.keys()):
             if prefix and not key.startswith(prefix_with_dot):
                 continue
 
             rel_key = key[len(prefix_with_dot):] if prefix else key
 
-            # Check if this is a quantization parameter (ends with .weight_scale)
-            if rel_key.endswith(".weight_scale") or rel_key == "weight_scale":
+            # Check if this is a quantization parameter.
+            if any(rel_key == name or rel_key.endswith(f".{name}") for name in quant_param_names):
                 item = state_dict.pop(key)
                 assert isinstance(item, torch.Tensor)
                 # Store as attribute (e.g., "weight_scale" or "gate_up_proj.weight_scale")

@@ -26,10 +26,21 @@ def _shard_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Te
         ".down_proj",
     ]
     for key, value in state_dict.items():
+        is_input_scale = key.endswith(".input_scale")
+        is_input_zero_point = key.endswith(".input_zero_point")
+        is_weight = key.endswith(".weight")
+
         if any(key.count(sub) for sub in SPLIT_DIM_0_LIST):
-            shard_state_dict[key] = value.chunk(n, dim=0)[r]
+            if is_input_scale or is_input_zero_point:
+                shard_state_dict[key] = value
+            else:
+                shard_state_dict[key] = value.chunk(n, dim=0)[r]
         elif any(key.count(sub) for sub in SPLIT_DIM_1_LIST):
-            shard_state_dict[key] = value.chunk(n, dim=1)[r]
+            if is_weight:
+                shard_state_dict[key] = value.chunk(n, dim=1)[r]
+            else:
+                # For row-parallel layers, non-weight tensors (e.g., scales) are replicated.
+                shard_state_dict[key] = value
         elif key.count("lm_head") or key.count("embed_tokens"):
             num_embeddings = value.shape[0]
             num_embeddings_per_partition = div_ceil(num_embeddings, n)
@@ -51,22 +62,28 @@ def _merge_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Te
         if key in filtered_state_dict:
             continue
 
-        # Merge QKV projections (weight and weight_scale)
+        # Merge QKV projections (weight/weight_scale/input_scale)
         if ".q_proj." in key:
             k_key = key.replace(".q_proj.", ".k_proj.")
             v_key = key.replace(".q_proj.", ".v_proj.")
 
             if k_key in original_keys and v_key in original_keys:
-                # Concatenate Q, K, V
                 q_val = state_dict[key]
                 k_val = state_dict[k_key]
                 v_val = state_dict[v_key]
                 new_key = key.replace(".q_proj.", ".qkv_proj.")
-                filtered_state_dict[new_key] = torch.cat([q_val, k_val, v_val], dim=0)
+                if key.endswith(".input_scale"):
+                    merged_scale = torch.stack(
+                        [q_val.to(torch.float32), k_val.to(torch.float32), v_val.to(torch.float32)],
+                        dim=0,
+                    ).amax(dim=0)
+                    filtered_state_dict[new_key] = merged_scale.to(q_val.dtype)
+                else:
+                    filtered_state_dict[new_key] = torch.cat([q_val, k_val, v_val], dim=0)
             else:
                 filtered_state_dict[key] = state_dict[key]
 
-        # Merge Gate/Up projections (weight and weight_scale)
+        # Merge Gate/Up projections (weight/weight_scale/input_scale)
         elif ".gate_proj." in key:
             up_key = key.replace(".gate_proj.", ".up_proj.")
 
@@ -74,7 +91,14 @@ def _merge_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Te
                 gate_val = state_dict[key]
                 up_val = state_dict[up_key]
                 new_key = key.replace(".gate_proj.", ".gate_up_proj.")
-                filtered_state_dict[new_key] = torch.cat([gate_val, up_val], dim=0)
+                if key.endswith(".input_scale"):
+                    merged_scale = torch.stack(
+                        [gate_val.to(torch.float32), up_val.to(torch.float32)],
+                        dim=0,
+                    ).amax(dim=0)
+                    filtered_state_dict[new_key] = merged_scale.to(gate_val.dtype)
+                else:
+                    filtered_state_dict[new_key] = torch.cat([gate_val, up_val], dim=0)
             else:
                 filtered_state_dict[key] = state_dict[key]
 
