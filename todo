@@ -3,7 +3,7 @@
 - add static quant support
 - replace sglang w8a8 kernel to local triton kernel
 - replace fakequant float activation to real q15.16 input output as model dtype
-- 
+- support mix percision static and dynamic quantization in one model
 
           integer    w8a8     float      kv_pertensor_int8
 gms8k     0.8469     0.8506   0.8916     0.8461

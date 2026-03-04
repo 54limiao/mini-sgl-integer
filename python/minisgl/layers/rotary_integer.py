@@ -56,24 +56,54 @@ class RotaryEmbeddingInteger(StateLessOP):
             query: Rotated tensor [batch_size, num_qo_heads, head_size] (3D)
             key: Rotated tensor [batch_size, num_kv_heads * head_size] (2D flat, same stride as input)
         """
-        # Save input dtype for later dequantization
         input_dtype = query.dtype
-        
-        # Get shapes
-        batch_size = query.shape[0]
-        num_qo_heads = query.shape[1] // self.head_size
-        num_kv_heads = key.shape[1] // self.head_size
-        
-        # Step 1: Quantize inputs to Q15.16
         query_fixed = to_fixed(query)
         key_fixed = to_fixed(key)
-        
-        # Step 2: Reshape to 3D and convert to bfloat16 for RoPE computation
-        # flashinfer requires fp16/bf16, not float32
-        query_3d = (query_fixed.to(torch.float32) / FIXED_POINT_SCALE).view(batch_size, num_qo_heads, self.head_size).to(torch.bfloat16)
-        key_3d = (key_fixed.to(torch.float32) / FIXED_POINT_SCALE).view(batch_size, num_kv_heads, self.head_size).to(torch.bfloat16)
-        
-        # Step 3: Apply RoPE using flashinfer (inplace)
+        query_out_fixed, key_out_fixed = self.forward_q15(positions, query_fixed, key_fixed)
+
+        query_out = from_fixed(query_out_fixed, input_dtype)
+        key_out_float = from_fixed(key_out_fixed, input_dtype)
+        key.copy_(key_out_float)
+
+        return query_out, key
+
+    def forward_q15(
+        self,
+        positions: torch.Tensor,
+        query_q15: torch.Tensor,
+        key_q15: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply RoPE + Hadamard with Q15.16 input/output.
+
+        Args:
+            positions: Position indices [batch_size]
+            query_q15: Query [batch_size, num_qo_heads * head_size] in Q15.16 int32
+            key_q15: Key [batch_size, num_kv_heads * head_size] in Q15.16 int32
+
+        Returns:
+            query_out_q15: [batch_size, num_qo_heads, head_size] in Q15.16 int32
+            key_out_q15: [batch_size, num_kv_heads * head_size] in Q15.16 int32
+        """
+        if query_q15.dtype != torch.int32:
+            raise TypeError(f"query_q15 must be int32 Q15.16, got {query_q15.dtype}")
+        if key_q15.dtype != torch.int32:
+            raise TypeError(f"key_q15 must be int32 Q15.16, got {key_q15.dtype}")
+
+        batch_size = query_q15.shape[0]
+        num_qo_heads = query_q15.shape[1] // self.head_size
+        num_kv_heads = key_q15.shape[1] // self.head_size
+
+        query_3d = (
+            (query_q15.to(torch.float32) / FIXED_POINT_SCALE)
+            .view(batch_size, num_qo_heads, self.head_size)
+            .to(torch.bfloat16)
+        )
+        key_3d = (
+            (key_q15.to(torch.float32) / FIXED_POINT_SCALE)
+            .view(batch_size, num_kv_heads, self.head_size)
+            .to(torch.bfloat16)
+        )
+
         self.apply_rope_with_cos_sin_cache_inplace(
             positions=positions,
             query=query_3d,
@@ -81,40 +111,33 @@ class RotaryEmbeddingInteger(StateLessOP):
             head_size=self.head_size,
             cos_sin_cache=self._cos_sin_cache,
         )
-        
-        # Step 3.5: Apply Fast Hadamard Transform along head_dim dimension
+
         hadamard_scale = 1.0 / math.sqrt(self.head_size)
-        
-        # Apply Hadamard to query (reshape to 2D, transform, reshape back to 3D)
+
         query_2d = query_3d.view(-1, self.head_size)
-        query_2d = fwht(query_2d.to(torch.float32), scale=hadamard_scale, inplace=True).to(torch.bfloat16)
+        query_2d = fwht(query_2d.to(torch.float32), scale=hadamard_scale, inplace=True).to(
+            torch.bfloat16
+        )
         query_3d = query_2d.view(batch_size, num_qo_heads, self.head_size)
-        
-        # Apply Hadamard to key (reshape to 2D, transform, reshape back to 3D)
+
         key_2d = key_3d.view(-1, self.head_size)
-        key_2d = fwht(key_2d.to(torch.float32), scale=hadamard_scale, inplace=True).to(torch.bfloat16)
+        key_2d = fwht(key_2d.to(torch.float32), scale=hadamard_scale, inplace=True).to(
+            torch.bfloat16
+        )
         key_3d = key_2d.view(batch_size, num_kv_heads, self.head_size)
-        
-        # Step 4: Quantize back to Q15.16 (simulate integer-only output)
-        query_out_fixed = torch.clamp(
-            torch.round(query_3d.to(torch.float32) * FIXED_POINT_SCALE), 
-            -2**31, 2**31 - 1
+
+        query_out_q15 = torch.clamp(
+            torch.round(query_3d.to(torch.float32) * FIXED_POINT_SCALE),
+            -2**31,
+            2**31 - 1,
         ).to(torch.int32)
-        key_out_fixed = torch.clamp(
-            torch.round(key_3d.to(torch.float32) * FIXED_POINT_SCALE), 
-            -2**31, 2**31 - 1
+        key_out_q15 = torch.clamp(
+            torch.round(key_3d.to(torch.float32) * FIXED_POINT_SCALE),
+            -2**31,
+            2**31 - 1,
         ).to(torch.int32)
-        
-        # Step 5: Dequantize back to original dtype
-        # query stays 3D [batch, num_heads, head_dim] for attention computation
-        query_out = from_fixed(query_out_fixed, input_dtype)
-        
-        # Step 6: For key, we need to preserve the original stride/layout
-        # Write the rotated values back to the original key tensor (inplace)
-        key_out_float = from_fixed(key_out_fixed.view(batch_size, -1), input_dtype)
-        key.copy_(key_out_float)
-        
-        return query_out, key
+
+        return query_out_q15, key_out_q15.view(batch_size, -1)
 
 
 def _get_rope_integer(

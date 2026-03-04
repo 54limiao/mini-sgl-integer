@@ -1,13 +1,9 @@
 """
 Integer-only MLP components using Q15.16 fixed-point format.
 
-This module provides pseudo-quantized versions of MLP components that:
-1. Convert float inputs to Q15.16 fixed-point
-2. Perform computation using FlashInfer (still float internally)
-3. Convert results back to Q15.16 fixed-point
-4. Return as float
-
-This is for validating the integer-only MLP inference path.
+This module provides integer-first building blocks. For attention, qk_norm and
+rotary run through Q15.16 paths, and only the backend attention op remains a
+float bridge.
 """
 
 from __future__ import annotations
@@ -23,18 +19,16 @@ from minisgl.layers import (
     LinearColParallelMerged,
     LinearOProj,
     LinearQKVMerged,
-    LinearReplicated,
     LinearRowParallel,
-    RMSNorm,
     StateLessOP,
 )
 from minisgl.layers.activation_integer import silu_and_mul_fixed, silu_and_mul_q15
+from minisgl.layers.norm_integer import RMSNormInteger
 from minisgl.layers.rotary_integer import get_rope_integer
 from minisgl.models import ModelConfig
 from minisgl.utils import div_even, nvtx_annotate
 
 if TYPE_CHECKING:
-    from minisgl.layers import RMSNorm as RMSNormType
     from minisgl.models import RotaryConfig
 
 
@@ -105,8 +99,8 @@ class AttentionLayerInteger(StateLessOP):
         num_kv_heads: int,
         head_dim: int,
         rotary_config: RotaryConfig,
-        q_norm: RMSNormType | None = None,
-        k_norm: RMSNormType | None = None,
+        q_norm: BaseOP | None = None,
+        k_norm: BaseOP | None = None,
     ):
         assert num_qo_heads % num_kv_heads == 0
         self.layer_id = layer_id
@@ -149,6 +143,16 @@ class AttentionLayerInteger(StateLessOP):
         self.attn_scale_fused = True
 
     def forward(self, qkv: torch.Tensor) -> torch.Tensor:
+        if qkv.dtype == torch.int32:
+            return self.forward_q15(qkv)
+
+        out_q15 = self.forward_q15(to_fixed(qkv))
+        return from_fixed(out_q15, qkv.dtype)
+
+    def forward_q15(self, qkv_q15: torch.Tensor) -> torch.Tensor:
+        if qkv_q15.dtype != torch.int32:
+            raise TypeError(f"qkv_q15 must be int32 Q15.16, got {qkv_q15.dtype}")
+
         ctx = get_global_ctx()
 
         # Backend-driven policy: fuse q scale only when requested by backend.
@@ -163,16 +167,48 @@ class AttentionLayerInteger(StateLessOP):
         if requires_q_scale_fusion and not self.attn_scale_fused:
             self.fuse_attn_scale_into_qnorm()
 
-        q, k, v = qkv.split([self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim], dim=-1)
+        q_q15, k_q15, v_q15 = qkv_q15.split(
+            [self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim], dim=-1
+        )
+
         if self.q_norm is not None:
-            self.q_norm.forward_inplace(q.view(-1, self.num_qo_heads, self.head_dim))
+            q_flat = q_q15.view(-1, self.num_qo_heads, self.head_dim).reshape(-1, self.head_dim)
+            if hasattr(self.q_norm, "forward_q15"):
+                q_flat = self.q_norm.forward_q15(q_flat)
+            else:
+                q_flat = to_fixed(self.q_norm.forward(from_fixed(q_flat, torch.bfloat16)))
+            q_q15 = q_flat.view(-1, self.qo_attn_dim).contiguous()
+
         if self.k_norm is not None:
-            self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
-        # Apply pseudo-quantized RoPE
-        q, k = self.rotary.forward(ctx.batch.positions, q, k)
-        q = q.view(-1, self.num_qo_heads, self.head_dim)
+            k_flat = k_q15.view(-1, self.num_kv_heads, self.head_dim).reshape(-1, self.head_dim)
+            if hasattr(self.k_norm, "forward_q15"):
+                k_flat = self.k_norm.forward_q15(k_flat)
+            else:
+                k_flat = to_fixed(self.k_norm.forward(from_fixed(k_flat, torch.bfloat16)))
+            k_q15 = k_flat.view(-1, self.kv_attn_dim).contiguous()
+
+        if hasattr(self.rotary, "forward_q15"):
+            q_q15, k_q15 = self.rotary.forward_q15(ctx.batch.positions, q_q15, k_q15)
+        else:
+            q_float, k_float = self.rotary.forward(
+                ctx.batch.positions,
+                from_fixed(q_q15, torch.bfloat16),
+                from_fixed(k_q15, torch.bfloat16),
+            )
+            q_q15 = to_fixed(q_float.view(-1, self.qo_attn_dim))
+            k_q15 = to_fixed(k_float)
+
+        if q_q15.ndim == 2:
+            q_q15 = q_q15.view(-1, self.num_qo_heads, self.head_dim)
+        elif q_q15.ndim != 3:
+            raise ValueError(f"Unexpected q_q15 ndim={q_q15.ndim}, expected 2 or 3")
+
+        q = from_fixed(q_q15, torch.bfloat16)
+        k = from_fixed(k_q15, torch.bfloat16)
+        v = from_fixed(v_q15, torch.bfloat16)
+
         o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
-        return o.view(-1, self.qo_attn_dim)
+        return to_fixed(o.view(-1, self.qo_attn_dim))
 
 
 class RopeAttnInteger(BaseOP):
@@ -196,8 +232,8 @@ class RopeAttnInteger(BaseOP):
         )
         self.has_qk_norm = has_qk_norm
         if has_qk_norm:
-            self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
-            self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
+            self.q_norm = RMSNormInteger(head_dim, eps=config.rms_norm_eps)
+            self.k_norm = RMSNormInteger(head_dim, eps=config.rms_norm_eps)
         else:
             self.q_norm = None
             self.k_norm = None
@@ -227,9 +263,26 @@ class RopeAttnInteger(BaseOP):
     def forward_q15(self, x_q15: torch.Tensor) -> torch.Tensor:
         if x_q15.dtype != torch.int32:
             raise TypeError(f"x_q15 must be int32 Q15.16, got {x_q15.dtype}")
-        x = from_fixed(x_q15, torch.bfloat16)
-        out = self.forward(x)
-        return to_fixed(out)
+
+        qkv_is_int8 = (
+            getattr(self.qkv_proj, "weight", None) is not None
+            and self.qkv_proj.weight.dtype == torch.int8
+            and hasattr(self.qkv_proj, "weight_scale")
+        )
+        o_proj_is_int8 = (
+            getattr(self.o_proj, "weight", None) is not None
+            and self.o_proj.weight.dtype == torch.int8
+            and hasattr(self.o_proj, "weight_scale")
+        )
+
+        if not qkv_is_int8 or not o_proj_is_int8:
+            x = from_fixed(x_q15, torch.bfloat16)
+            out = self.forward(x)
+            return to_fixed(out)
+
+        qkv_q15 = self.qkv_proj.forward(x_q15)
+        o_q15 = self.attn.forward_q15(qkv_q15)
+        return self.o_proj.forward(o_q15)
 
 
 __all__ = [

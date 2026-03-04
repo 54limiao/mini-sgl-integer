@@ -71,9 +71,7 @@ class Qwen3DecoderLayerInteger(BaseOP):
 
         x_q15, residual_q15 = self.input_layernorm.forward_q15(x_q15, residual_q15)
 
-        x_attn = from_fixed(x_q15, torch.bfloat16)
-        x_attn = self.self_attn.forward(x_attn)
-        x_q15 = to_fixed(x_attn)
+        x_q15 = self.self_attn.forward_q15(x_q15)
 
         x_q15, residual_q15 = self.post_attention_layernorm.forward_q15(x_q15, residual_q15)
 
