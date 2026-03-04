@@ -65,7 +65,15 @@ class GatedMLPInteger(BaseOP):
 
 
 class AttentionLayerInteger(StateLessOP):
-    """Attention layer with pseudo-quantized RoPE."""
+    """Attention layer with pseudo-quantized RoPE.
+
+    The q_norm attention scale fusion is backend-driven. If the active
+    attention backend sets ``requires_q_scale_fusion=True``, we fuse
+    ``1/sqrt(head_dim)`` into q_norm once and then run with ``sm_scale=1.0``.
+    """
+
+    # Whether sm_scale has been absorbed into q_norm weight.
+    attn_scale_fused: bool = False
 
     def __init__(
         self,
@@ -96,8 +104,42 @@ class AttentionLayerInteger(StateLessOP):
         self.q_norm = q_norm
         self.k_norm = k_norm
 
+        # Track whether the scale has been fused (will be applied after weights
+        # are loaded – see ``fuse_attn_scale_into_qnorm``).
+        self.attn_scale_fused = False
+
+    # ------------------------------------------------------------------
+    # Public helper – call *after* model weights have been loaded.
+    # ------------------------------------------------------------------
+    def fuse_attn_scale_into_qnorm(self) -> None:
+        """Multiply ``q_norm.weight`` by ``head_dim^(-0.5)`` in-place.
+
+        After calling this the integer attention kernel can use ``sm_scale=1.0``
+        because the attention scale is already part of the normalised Q.
+        """
+        if self.attn_scale_fused:
+            return  # idempotent
+        if self.q_norm is None:
+            return  # nothing to fuse
+        sm_scale = self.head_dim ** -0.5
+        self.q_norm.weight.data.mul_(sm_scale)
+        self.attn_scale_fused = True
+
     def forward(self, qkv: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
+
+        # Backend-driven policy: fuse q scale only when requested by backend.
+        backend = ctx.attn_backend
+        requires_q_scale_fusion = getattr(backend, "requires_q_scale_fusion", False)
+        if not requires_q_scale_fusion and hasattr(backend, "prefill_backend") and hasattr(
+            backend, "decode_backend"
+        ):
+            selected_backend = backend.prefill_backend if ctx.batch.is_prefill else backend.decode_backend
+            requires_q_scale_fusion = getattr(selected_backend, "requires_q_scale_fusion", False)
+
+        if requires_q_scale_fusion and not self.attn_scale_fused:
+            self.fuse_attn_scale_into_qnorm()
+
         q, k, v = qkv.split([self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim], dim=-1)
         if self.q_norm is not None:
             self.q_norm.forward_inplace(q.view(-1, self.num_qo_heads, self.head_dim))
@@ -160,4 +202,8 @@ class RopeAttnInteger(BaseOP):
         return self.o_proj.forward(o)
 
 
-__all__ = ["GatedMLPInteger", "RopeAttnInteger", "AttentionLayerInteger"]
+__all__ = [
+    "GatedMLPInteger",
+    "RopeAttnInteger",
+    "AttentionLayerInteger",
+]

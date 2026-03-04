@@ -1,16 +1,23 @@
 """
-Int8 Quantized Attention Backend using FlashInfer.
+Integer Triton attention backend for mini-sglang.
 
-This implementation provides:
-1. Per-token dynamic quantization of Q, K, V to int8
-2. Dequantization before attention computation
-3. Reuses FlashInfer backend for actual attention (supports Paged KV Cache)
+End-to-end flow
+---------------
+1. bf16 Q / K / V arrive from model layers.
+2. Prefill path dynamically quantizes Q / K / V to int8 using prototype-style
+   multiplier/shift parameters and runs integer-only attention compute.
+3. Decode path uses standard bf16 Triton decode (memory-bound; avoids KV int8
+   cache quantization overhead/OOM risk).
+4. Output is written back as bf16.
+
+This backend requires q-scale fusion (1/sqrt(head_dim) folded into q_norm) for
+the integer prefill path, so ``sm_scale = 1.0``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -22,11 +29,6 @@ from .base import BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
 
 if TYPE_CHECKING:
-    from flashinfer import (
-        BatchDecodeWithPagedKVCacheWrapper,
-        BatchPrefillWithPagedKVCacheWrapper,
-        CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
-    )
     from minisgl.kvcache import BaseKVCache
     from minisgl.models import ModelConfig
 
@@ -47,298 +49,251 @@ class Int8CaptureData(BaseCaptureData):
 
 @dataclass
 class Int8Metadata(BaseAttnMetadata):
-    """Metadata for Int8 attention (reuses FlashInfer's metadata structure)."""
-    cu_seqlens_q_cpu: torch.Tensor  # on cpu
-    cu_seqlens_k_cpu: torch.Tensor  # on cpu
-    cu_seqlens_q_gpu: torch.Tensor  # on gpu
-    indices: torch.Tensor  # on gpu
-    last_page_len_cpu: torch.Tensor  # on cpu
-    num_qo_heads: int
-    num_kv_heads: int
-    head_dim: int
-    page_size: int  # currently only support page_size=1
-    pos_encoding_mode: str
-    seq_lens_cpu: torch.Tensor  # on cpu
-    dtype: torch.dtype
-    wrapper: BatchPrefillWithPagedKVCacheWrapper | BatchDecodeWithPagedKVCacheWrapper
-    initialized: bool = False
+    """Metadata for the int8 Triton attention backend."""
 
-    def __post_init__(self) -> None:
-        assert self.page_size == 1, "Currently only page_size=1 is supported."
-        assert (
-            self.cu_seqlens_k_cpu.is_cpu
-            and self.cu_seqlens_q_cpu.is_cpu
-            and self.cu_seqlens_q_gpu.is_cuda
-            and self.indices.is_cuda
-            and self.last_page_len_cpu.is_cpu
-            and self.seq_lens_cpu.is_cpu
-        )
+    kv_indptr: torch.Tensor  # [batch_size + 1] cumulative KV lengths
+    kv_indices: torch.Tensor  # [total_kv_tokens] physical page indices
+    qo_indptr: Optional[torch.Tensor]  # [batch_size + 1] (prefill only)
+    max_seqlen_q: int
+    max_seqlen_k: int
+    causal: bool = True
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
-        return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
+        if self.qo_indptr is not None:
+            return self.qo_indptr[1 : 1 + bs] - 1
+        return torch.arange(bs, device=self.kv_indptr.device)
 
 
 class Int8Backend(BaseAttnBackend):
-    """Int8 quantized attention backend using FlashInfer."""
+    """Integer Triton attention backend.
 
-    def __init__(self, config: ModelConfig, kvcache: BaseKVCache) -> None:
-        from flashinfer import (
-            BatchDecodeWithPagedKVCacheWrapper,
-            BatchPrefillWithPagedKVCacheWrapper,
+    Heavy prefill matmuls (QK^T, attn·V) run in int8/int32 through the integer
+    reference kernel path. Decode remains bf16 Triton for memory/perf stability.
+    """
+
+    def __init__(self, config: "ModelConfig", kvcache: "BaseKVCache") -> None:
+        from minisgl.kernel.triton.int8_attention_kernels import (
+            int8_context_attention_fwd,
+            quantize_per_tensor_int8,
+            quantize_per_tensor_int8_ms,
+        )
+        from minisgl.kernel.triton.attention_kernels import (
+            decode_attention_fwd as _fp_decode_fwd,
         )
 
         self.config = config
         self.kvcache = kvcache
         self.device = kvcache.device
 
-        # Allocate workspace buffer for FlashInfer
-        self.float_workspace_buffer = torch.empty(
-            128 * 1024 * 1024, dtype=torch.uint8, device=self.device
-        )
-
-        # Create wrappers (same as FlashInferBackend)
-        self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-            self.float_workspace_buffer,
-            kv_layout="NHD",
-            backend="fa2",
-        )
-        self.decode_wrappers = BatchDecodeWithPagedKVCacheWrapper(
-            self.float_workspace_buffer,
-            use_tensor_cores=self._use_tensor_cores(),
-            kv_layout="NHD",
-            backend="fa2",
-        )
-
-        # Reuse int workspace buffer
-        self.int_workspace_buffer = self.prefill_wrapper._int_workspace_buffer
-        self.decode_wrappers._int_workspace_buffer = self.int_workspace_buffer
-
-        # Head dimensions
+        # Head info
         tp_size = get_tp_info().size
-        self.qo_head_local = div_even(self.config.num_qo_heads, tp_size)
-        self.kv_head_local = div_even(self.config.num_kv_heads, tp_size)
+        self.qo_head_local = div_even(config.num_qo_heads, tp_size)
+        self.kv_head_local = div_even(config.num_kv_heads, tp_size)
 
-        # Cache for ones tensor
-        self.cached_ones_cpu: torch.Tensor = torch.tensor([], dtype=torch.int32, pin_memory=True)
+        # Backend capability flag consumed by integer attention layers.
+        self.requires_q_scale_fusion = True
+
+        # Decode path still calls fp Triton decode; with fusion active,
+        # q is already scaled so sm_scale must remain 1.0.
+        self.sm_scale = 1.0
+        logger.info("Int8Backend: sm_scale=1.0 (backend requires q-scale fusion)")
 
         # CUDA graph support
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
-        self.graph_wrappers: dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
         self.capture: Int8CaptureData | None = None
+        self.max_seq_len = 0
 
-        # Attention scale
-        self.scale = (self.config.head_dim ** -0.5)
-
-    def _use_tensor_cores(self) -> bool:
-        """Determine if tensor cores should be used."""
-        GQA = self.config.num_qo_heads // self.config.num_kv_heads
-        return GQA >= 4
-
-    def _get_ones_cpu(self, bs: int) -> torch.Tensor:
-        """Get cached ones tensor."""
-        if bs <= len(self.cached_ones_cpu):
-            return self.cached_ones_cpu[:bs]
-        next_len = max(bs, 1)
-        while next_len < bs:
-            next_len *= 2
-        self.cached_ones_cpu = torch.ones(next_len, dtype=torch.int32, pin_memory=True)
-        return self.cached_ones_cpu[:bs]
-
-    @staticmethod
-    def _initialize_metadata_once(metadata: Int8Metadata) -> None:
-        """Initialize metadata for FlashInfer wrapper (same as FlashInferBackend)."""
-        if metadata.initialized:
-            return
-
-        from flashinfer import BatchDecodeWithPagedKVCacheWrapper
-
-        metadata.initialized = True
-        if isinstance(metadata.wrapper, BatchDecodeWithPagedKVCacheWrapper):
-            metadata.wrapper.plan(
-                indptr=metadata.cu_seqlens_k_cpu,
-                indices=metadata.indices,
-                last_page_len=metadata.last_page_len_cpu,
-                num_qo_heads=metadata.num_qo_heads,
-                num_kv_heads=metadata.num_kv_heads,
-                head_dim=metadata.head_dim,
-                page_size=metadata.page_size,
-                pos_encoding_mode=metadata.pos_encoding_mode,
-                seq_lens=metadata.seq_lens_cpu,
-                data_type=metadata.dtype,
-                q_data_type=metadata.dtype,
-                kv_data_type=metadata.dtype,
-                non_blocking=True,
-            )
-        else:
-            metadata.wrapper.plan(
-                qo_indptr=metadata.cu_seqlens_q_cpu,
-                paged_kv_indptr=metadata.cu_seqlens_k_cpu,
-                paged_kv_indices=metadata.indices,
-                paged_kv_last_page_len=metadata.last_page_len_cpu,
-                num_qo_heads=metadata.num_qo_heads,
-                num_kv_heads=metadata.num_kv_heads,
-                head_dim_qk=metadata.head_dim,
-                page_size=metadata.page_size,
-                pos_encoding_mode=metadata.pos_encoding_mode,
-                seq_lens=metadata.seq_lens_cpu,
-                q_data_type=metadata.dtype,
-                kv_data_type=metadata.dtype,
-                non_blocking=True,
-                causal=True,
-            )
-
-    def _quantize_to_int8(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Per-tensor dynamic quantization to int8.
-
-        Args:
-            x: Input tensor [total_tokens, num_heads, head_dim]
-
-        Returns:
-            (quantized_tensor, scale)
-            - quantized_tensor: int8 tensor [total_tokens, num_heads, head_dim]
-            - scale: scalar scale factor
-        """
-        # Compute max absolute value across the entire tensor
-        x_abs_max = torch.abs(x).amax()
-        # Compute scale factor (scalar)
-        scale = x_abs_max.clamp(min=1e-5) / 127.0
-        # Quantize
-        x_quantized = torch.clamp(torch.round(x / scale), -128, 127).to(torch.int8)
-        return x_quantized, scale
-
-    def _dequantize_from_int8(
-        self, x_int8: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype
-    ) -> torch.Tensor:
-        """
-        Dequantize from int8.
-
-        Args:
-            x_int8: int8 tensor [total_tokens, num_heads, head_dim]
-            scale: scalar scale factor
-            dtype: output dtype
-
-        Returns:
-            Dequantized tensor
-        """
-        return (x_int8.to(torch.float32) * scale).to(dtype)
+        # Store kernel functions
+        self._quantize = quantize_per_tensor_int8
+        self._quantize_ms = quantize_per_tensor_int8_ms
+        self._prefill_fwd = int8_context_attention_fwd
+        self._fp_decode_fwd = _fp_decode_fwd
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_id: int,
+        batch: Batch,
     ) -> torch.Tensor:
-        """
-        Compute attention with int8 quantization.
-
-        Process:
-        1. Quantize Q, K, V to int8 (per-token dynamic)
-        2. Dequantize back to original dtype
-        3. Use FlashInfer for actual attention computation
-        4. Store dequantized K, V to KV cache
-
-        Note: Currently this is for testing the quantization pipeline.
-        Future optimization: keep K, V in int8 in cache and use int8 kernels.
-        """
         metadata = batch.attn_metadata
         assert isinstance(metadata, Int8Metadata)
 
-        # Step 1: Quantize Q, K, V to int8
-        q_int8, q_scale = self._quantize_to_int8(q)
-        k_int8, k_scale = self._quantize_to_int8(k)
-        v_int8, v_scale = self._quantize_to_int8(v)
+        # 1) Store K, V to cache (bf16)
+        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
 
-        # Step 2: Dequantize back to original dtype
-        k_deq = self._dequantize_from_int8(k_int8, k_scale, k.dtype)
-        v_deq = self._dequantize_from_int8(v_int8, v_scale, v.dtype)
-        q_deq = self._dequantize_from_int8(q_int8, q_scale, q.dtype)
+        # 2) Prepare output tensor
+        output = torch.empty_like(q)
 
-        # Step 3: Store K, V to cache
-        self.kvcache.store_kv(k_deq, v_deq, batch.out_loc, layer_id)
+        if batch.is_decode:
+            self._forward_decode(q, layer_id, metadata, output)
+        else:
+            k_for_prefill = (
+                k.view(-1, self.kv_head_local, self.config.head_dim) if k.ndim == 2 else k
+            )
+            v_for_prefill = (
+                v.view(-1, self.kv_head_local, self.config.head_dim) if v.ndim == 2 else v
+            )
+            k_int8, k_mul, k_shift = self._quantize_ms(k_for_prefill)
+            v_int8, v_mul, v_shift = self._quantize_ms(v_for_prefill)
+            self._forward_prefill(
+                q=q,
+                k_int8=k_int8,
+                v_int8=v_int8,
+                k_mul=k_mul,
+                k_shift=k_shift,
+                v_mul=v_mul,
+                v_shift=v_shift,
+                metadata=metadata,
+                output=output,
+            )
 
-        # Step 4: Compute attention using FlashInfer
-        self._initialize_metadata_once(metadata)
-        kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
-        return metadata.wrapper.run(q=q_deq, paged_kv_cache=kv_cache)
+        return output
+
+    def _forward_decode(
+        self,
+        q: torch.Tensor,
+        layer_id: int,
+        metadata: Int8Metadata,
+        output: torch.Tensor,
+    ) -> None:
+        # Decode is memory-bound; use standard bf16 Triton decode.
+        k_cache = self.kvcache.k_cache(layer_id)
+        v_cache = self.kvcache.v_cache(layer_id)
+        k_cache = k_cache.view(-1, k_cache.shape[-2], k_cache.shape[-1])
+        v_cache = v_cache.view(-1, v_cache.shape[-2], v_cache.shape[-1])
+
+        self._fp_decode_fwd(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            att_out=output,
+            kv_indptr=metadata.kv_indptr,
+            kv_indices=metadata.kv_indices,
+            sm_scale=self.sm_scale,
+        )
+
+    def _forward_prefill(
+        self,
+        q: torch.Tensor,
+        k_int8: torch.Tensor,
+        v_int8: torch.Tensor,
+        k_mul: torch.Tensor,
+        k_shift: torch.Tensor,
+        v_mul: torch.Tensor,
+        v_shift: torch.Tensor,
+        metadata: Int8Metadata,
+        output: torch.Tensor,
+    ) -> None:
+        q_int8, q_mul, q_shift = self._quantize_ms(q)
+
+        assert metadata.qo_indptr is not None
+        bs = metadata.qo_indptr.shape[0] - 1
+        b_start_loc = metadata.qo_indptr[:bs]
+        b_seq_len = metadata.qo_indptr[1 : bs + 1] - metadata.qo_indptr[:bs]
+
+        self._prefill_fwd(
+            q_int8=q_int8,
+            k_int8=k_int8,
+            v_int8=v_int8,
+            o=output,
+            q_mul=q_mul,
+            q_shift=q_shift,
+            k_mul=k_mul,
+            k_shift=k_shift,
+            v_mul=v_mul,
+            v_shift=v_shift,
+            b_start_loc=b_start_loc,
+            b_seq_len=b_seq_len,
+            max_input_len=metadata.max_seqlen_q,
+            is_causal=metadata.causal,
+        )
 
     def prepare_metadata(self, batch: Batch) -> None:
-        """Prepare metadata (same as FlashInferBackend)."""
         reqs = batch.padded_reqs
         padded_size = len(reqs)
         seqlens_q = [req.extend_len for req in reqs]
         seqlens_k = [req.device_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
         max_seqlen_q = max(seqlens_q)
-        cpu_kwargs = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
+        max_seqlen_k = max(seqlens_k)
 
         device = self.device
-        seq_len_cpu = torch.tensor(seqlens_k, **cpu_kwargs)
-        cu_seqlens_k_cpu = torch.tensor([0] + seqlens_k, **cpu_kwargs).cumsum_(dim=0)
-        if max_seqlen_q == 1:  # decode with all extend_len = 1
-            cu_seqlens_q_cpu = torch.arange(0, padded_size + 1, **cpu_kwargs)
-        elif all(l == 0 for l in cached_lens):  # prefill with no cache hit
-            cu_seqlens_q_cpu = cu_seqlens_k_cpu
-        else:  # normal extend prefill, with partial cache hit
-            cu_seqlens_q_cpu = torch.tensor([0] + seqlens_q, **cpu_kwargs).cumsum_(dim=0)
+        cpu_kwargs = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
+
+        kv_indptr = torch.tensor([0] + seqlens_k, **cpu_kwargs).cumsum_(dim=0)
+        kv_indptr = kv_indptr.to(device, non_blocking=True)
 
         page_table = get_global_ctx().page_table
+        kv_indices = torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs])
+
+        qo_indptr = None
+        causal = True
+
+        if batch.is_prefill:
+            if max_seqlen_q == 1:
+                qo_indptr = torch.arange(0, padded_size + 1, device=device, dtype=torch.int32)
+            elif all(l == 0 for l in cached_lens):
+                qo_indptr = kv_indptr.clone()
+            else:
+                qo_indptr = torch.tensor([0] + seqlens_q, **cpu_kwargs).cumsum_(dim=0)
+                qo_indptr = qo_indptr.to(device, non_blocking=True)
+        else:
+            qo_indptr = None
+
         batch.attn_metadata = Int8Metadata(
-            cu_seqlens_q_cpu=cu_seqlens_q_cpu,
-            cu_seqlens_k_cpu=cu_seqlens_k_cpu,
-            cu_seqlens_q_gpu=cu_seqlens_q_cpu.to(device, non_blocking=True),
-            indices=torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs]),
-            last_page_len_cpu=self._get_ones_cpu(padded_size),
-            num_qo_heads=self.qo_head_local,
-            num_kv_heads=self.kv_head_local,
-            head_dim=self.config.head_dim,
-            page_size=1,
-            pos_encoding_mode="NONE",
-            seq_lens_cpu=seq_len_cpu,
-            dtype=self.kvcache.dtype,
-            wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            qo_indptr=qo_indptr,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            causal=causal,
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
-        """Initialize CUDA graph capture (same as FlashInferBackend)."""
-        from flashinfer import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
-
-        assert self.capture is None, "Capture already initialized."
+        assert self.capture is None, "Capture already initialised."
         max_bs = max(bs_list)
         capture = Int8CaptureData.create(max_bs, max_seq_len, self.kvcache.device)
+        self.max_seq_len = max_seq_len
+        capture.cu_seqlens_k.copy_(
+            torch.arange(0, max_bs + 1, dtype=torch.int32, device=self.device) * max_seq_len
+        )
         capture.page_table = capture.page_table.view(-1)
         self.max_graph_bs = max_bs
         self.capture = capture
         self.capture_bs = sorted(bs_list)
 
     def prepare_for_capture(self, batch: Batch) -> None:
-        """Prepare for CUDA graph capture (same as FlashInferBackend)."""
-        from flashinfer import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
-
         bs = batch.size
-        assert bs in self.capture_bs and bs not in self.graph_wrappers and self.capture
+        assert bs in self.capture_bs and self.capture
+        assert batch.is_decode, "CUDA graph capture only supports decode mode"
+
         capture = self.capture
-        self.graph_wrappers[bs] = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
-            self.float_workspace_buffer,
-            kv_layout="NHD",
-            use_tensor_cores=self._use_tensor_cores(),
-            indptr_buffer=capture.cu_seqlens_k[: bs + 1],
-            indices_buffer=capture.indices,
-            last_page_len_buffer=capture.one_tensor[:bs],
+        kv_indptr = capture.cu_seqlens_k[: bs + 1]
+        total_tokens = int(capture.cu_seqlens_k[bs].item())
+        kv_indices = capture.page_table[:total_tokens]
+
+        batch.attn_metadata = Int8Metadata(
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            qo_indptr=None,
+            max_seqlen_q=1,
+            max_seqlen_k=self.max_seq_len,
+            causal=True,
         )
-        self.graph_wrappers[bs]._backend = "fa2"
-        self.graph_wrappers[bs]._int_workspace_buffer = self.int_workspace_buffer
-        self.prepare_metadata(batch)
-        metadata = batch.attn_metadata
-        assert isinstance(metadata, Int8Metadata)
-        metadata.wrapper = self.graph_wrappers[bs]
-        self._initialize_metadata_once(metadata)
 
     def prepare_for_replay(self, batch: Batch) -> None:
-        """Prepare for CUDA graph replay (same as FlashInferBackend)."""
-        metadata, bs = batch.attn_metadata, batch.padded_size
-        assert isinstance(metadata, Int8Metadata) and not metadata.initialized
+        metadata = batch.attn_metadata
+        bs = batch.padded_size
+        assert isinstance(metadata, Int8Metadata)
         assert self.capture is not None and bs in self.capture_bs
-        metadata.wrapper = self.graph_wrappers[bs]
-        self._initialize_metadata_once(metadata)
+        assert batch.is_decode
+
+        self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.kv_indptr)
+        total_tokens = int(metadata.kv_indptr[bs].item())
+        self.capture.page_table[:total_tokens].copy_(metadata.kv_indices)
 
 
 __all__ = ["Int8Backend"]
