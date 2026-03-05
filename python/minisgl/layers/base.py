@@ -99,6 +99,12 @@ class BaseOP:
                 attr_name = rel_key.replace(".", "_")
                 setattr(self, attr_name, item)
 
+            # Consume hadamard auxiliary transform tensors from compressed-tensors checkpoints
+            # (e.g., model.layers.N.mlp.down_proj.R4_input.weight). Integer path uses
+            # FWHT kernels directly and does not require these dense transform matrices.
+            elif re.search(r"(^|\.)R\d+_input\.weight$", rel_key):
+                _ = state_dict.pop(key)
+
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
 

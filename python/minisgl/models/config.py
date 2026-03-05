@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 from transformers import PretrainedConfig
 
@@ -13,6 +13,72 @@ class RotaryConfig:
     max_position: int
     base: float
     scaling: Dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class HadamardTransformConfig:
+    enabled: bool = False
+    block_size: int = 0
+    targets: Tuple[str, ...] = ()
+
+
+def _parse_hadamard_transform_config(config: PretrainedConfig) -> HadamardTransformConfig:
+    quantization_config = getattr(config, "quantization_config", None)
+    if not isinstance(quantization_config, dict):
+        return HadamardTransformConfig()
+
+    transform_config = quantization_config.get("transform_config")
+    if not isinstance(transform_config, dict):
+        return HadamardTransformConfig()
+
+    config_groups = transform_config.get("config_groups")
+    if not isinstance(config_groups, dict):
+        return HadamardTransformConfig()
+
+    targets: list[str] = []
+    block_size = 0
+    for group in config_groups.values():
+        if not isinstance(group, dict):
+            continue
+        if str(group.get("type", "")).lower() != "hadamard":
+            continue
+
+        candidate_size = group.get("head_dim", group.get("size", 0))
+        if isinstance(candidate_size, int) and candidate_size > 0 and block_size <= 0:
+            block_size = candidate_size
+
+        apply_rules = group.get("apply", [])
+        if not isinstance(apply_rules, list):
+            continue
+
+        for rule in apply_rules:
+            if not isinstance(rule, dict):
+                continue
+            if rule.get("location") != "input":
+                continue
+            if bool(rule.get("inverse", False)):
+                continue
+            rule_targets = rule.get("targets", [])
+            if not isinstance(rule_targets, list):
+                continue
+            for target in rule_targets:
+                if isinstance(target, str):
+                    targets.append(target)
+
+    dedup_targets: list[str] = []
+    seen: set[str] = set()
+    for target in targets:
+        if target in seen:
+            continue
+        seen.add(target)
+        dedup_targets.append(target)
+
+    enabled = bool(dedup_targets) and block_size > 0
+    return HadamardTransformConfig(
+        enabled=enabled,
+        block_size=block_size,
+        targets=tuple(dedup_targets),
+    )
 
 
 @dataclass(frozen=True)
@@ -34,6 +100,7 @@ class ModelConfig:
     norm_topk_prob: bool
     model_type: str
     architectures: list[str]
+    hadamard_transform: HadamardTransformConfig = HadamardTransformConfig()
 
     @property
     def is_moe(self) -> bool:
@@ -50,6 +117,7 @@ class ModelConfig:
         moe_intermediate_size = getattr(config, "moe_intermediate_size", 0)
         norm_topk_prob = getattr(config, "norm_topk_prob", False)
         architectures = getattr(config, "architectures", ["LlamaForCausalLM"])
+        hadamard_transform = _parse_hadamard_transform_config(config)
 
         return cls(
             num_layers=config.num_hidden_layers,
@@ -75,4 +143,5 @@ class ModelConfig:
             norm_topk_prob=norm_topk_prob,
             model_type=model_type,
             architectures=architectures,
+            hadamard_transform=hadamard_transform,
         )

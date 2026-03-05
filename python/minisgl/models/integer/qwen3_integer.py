@@ -44,7 +44,7 @@ class Qwen3DecoderLayerInteger(BaseOP):
     """Qwen3 decoder layer with integer-only components."""
 
     def __init__(self, config: ModelConfig, layer_id: int):
-        self.mlp = GatedMLPInteger(config)
+        self.mlp = GatedMLPInteger(config, layer_id=layer_id)
         self.self_attn = RopeAttnInteger(config, layer_id, has_qk_norm=True)
 
         self.input_layernorm = RMSNormFusedInteger(

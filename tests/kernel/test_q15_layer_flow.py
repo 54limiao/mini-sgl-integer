@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import torch
 
-from minisgl.kernel.fixed_point import Q15Tensor, from_fixed, to_fixed
+from minisgl.kernel.fixed_point import Q15Tensor, from_fixed, fwht_int_q15, to_fixed
 from minisgl.layers.activation_integer import silu_and_mul_fixed, silu_and_mul_q15
 from minisgl.layers.norm_integer import RMSNormFusedInteger, RMSNormInteger
 from minisgl.layers.quantization.w8a8_int8 import W8A8Int8LinearMethod
+from minisgl.models.utils_integer import apply_blockwise_fwht_q15
 
 
 class _FakeQuantLinear(torch.nn.Module):
@@ -140,3 +141,21 @@ class TestQ15LayerFlow:
         assert out_q15.dtype == torch.int32
         assert out_q15.shape == out_fp.shape
         assert cos > 0.999, f"Q15 linear cosine too low: {cos}"
+
+    def test_blockwise_hadamard_q15_view_path(self):
+        if not torch.cuda.is_available():
+            return
+
+        x = torch.randn(5, 3 * 256, device="cuda", dtype=torch.bfloat16)
+        x_q15 = to_fixed(x)
+
+        out_q15 = apply_blockwise_fwht_q15(x_q15, block_size=256)
+
+        manual = fwht_int_q15(
+            x_q15.contiguous().view(-1, x_q15.shape[-1] // 256, 256),
+            normalize=True,
+        ).view_as(x_q15)
+
+        assert out_q15.shape == x_q15.shape
+        assert out_q15.dtype == torch.int32
+        assert torch.equal(out_q15, manual)

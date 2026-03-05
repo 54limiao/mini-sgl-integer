@@ -8,11 +8,12 @@ float bridge.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 import torch
 from minisgl.core import get_global_ctx
-from minisgl.kernel.fixed_point import from_fixed, to_fixed
+from minisgl.kernel.fixed_point import from_fixed, fwht_int_q15, to_fixed
 from minisgl.distributed import get_tp_info
 from minisgl.layers import (
     BaseOP,
@@ -32,10 +33,37 @@ if TYPE_CHECKING:
     from minisgl.models import RotaryConfig
 
 
+def _match_target(layer_name: str, target: str) -> bool:
+    if target.startswith("re:"):
+        return re.match(target[3:], layer_name) is not None
+    return layer_name == target
+
+
+def _is_hadamard_targeted(layer_name: str, targets: tuple[str, ...]) -> bool:
+    return any(_match_target(layer_name, target) for target in targets)
+
+
+def apply_blockwise_fwht_q15(x_q15: torch.Tensor, block_size: int) -> torch.Tensor:
+    if x_q15.dtype != torch.int32:
+        raise TypeError(f"x_q15 must be int32 Q15.16, got {x_q15.dtype}")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be > 0, got {block_size}")
+
+    hidden = x_q15.shape[-1]
+    if hidden % block_size != 0:
+        raise ValueError(
+            f"Last dim {hidden} must be divisible by hadamard block_size {block_size}"
+        )
+
+    x_blocks = x_q15.contiguous().view(-1, hidden // block_size, block_size)
+    y_blocks = fwht_int_q15(x_blocks, normalize=True)
+    return y_blocks.view_as(x_q15)
+
+
 class GatedMLPInteger(BaseOP):
     """GatedMLP with pseudo-quantized SILU activation."""
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, layer_id: int | None = None):
         self.gate_up_proj = LinearColParallelMerged(
             config.hidden_size,
             [config.intermediate_size, config.intermediate_size],
@@ -48,6 +76,16 @@ class GatedMLPInteger(BaseOP):
             config.intermediate_size,
             config.hidden_size,
             has_bias=False,
+        )
+
+        self._down_proj_name = (
+            f"model.layers.{layer_id}.mlp.down_proj" if layer_id is not None else "mlp.down_proj"
+        )
+        self._hadamard_block_size = config.hadamard_transform.block_size
+        self._apply_hadamard = (
+            config.hadamard_transform.enabled
+            and self._hadamard_block_size > 0
+            and _is_hadamard_targeted(self._down_proj_name, config.hadamard_transform.targets)
         )
 
     @nvtx_annotate("MLP (Integer)")
@@ -78,6 +116,8 @@ class GatedMLPInteger(BaseOP):
 
         gate_up_q15 = self.gate_up_proj.forward(x_q15)
         y_q15 = silu_and_mul_q15(gate_up_q15)
+        if self._apply_hadamard:
+            y_q15 = apply_blockwise_fwht_q15(y_q15, self._hadamard_block_size)
         return self.down_proj.forward(y_q15)
 
 
@@ -262,6 +302,7 @@ class RopeAttnInteger(BaseOP):
 
 
 __all__ = [
+    "apply_blockwise_fwht_q15",
     "GatedMLPInteger",
     "RopeAttnInteger",
     "AttentionLayerInteger",
