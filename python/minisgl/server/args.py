@@ -16,6 +16,7 @@ class ServerArgs(SchedulerConfig):
     server_host: str = "127.0.0.1"
     server_port: int = 1919
     num_tokenizer: int = 0
+    prefix_prompt: str = ""
     silent_output: bool = False
 
     @property
@@ -66,6 +67,11 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     from minisgl.moe import SUPPORTED_MOE_BACKENDS
 
     parser = argparse.ArgumentParser(description="MiniSGL Server Arguments")
+
+    def _unescape_cli_text(text: str) -> str:
+        if text == "":
+            return text
+        return bytes(text, "utf-8").decode("unicode_escape")
 
     parser.add_argument(
         "--model-path",
@@ -162,6 +168,13 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--prefix-prompt",
+        type=str,
+        default=ServerArgs.prefix_prompt,
+        help="Server-side prefix prepended before every user prompt. Supports escaped sequences like \\n.",
+    )
+
+    parser.add_argument(
         "--max-prefill-length",
         "--max-extend-length",
         type=int,
@@ -229,6 +242,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
+
+    kwargs["prefix_prompt"] = _unescape_cli_text(kwargs["prefix_prompt"])
 
     if kwargs["model_source"] == "modelscope":
         model_path = kwargs["model_path"]

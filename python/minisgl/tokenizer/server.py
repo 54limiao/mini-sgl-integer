@@ -36,6 +36,7 @@ def tokenize_worker(
     backend_addr: str,
     frontend_addr: str,
     local_bs: int,
+    prefix_prompt: str = "",
     tokenizer_id: int = -1,
     model_source: str = "huggingface",
     ack_queue: mp.Queue[str] | None = None,
@@ -50,7 +51,7 @@ def tokenize_worker(
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer)
+    tokenize_manager = TokenizeManager(tokenizer, prefix_prompt=prefix_prompt)
     detokenize_manager = DetokenizeManager(tokenizer)
 
     if ack_queue is not None:

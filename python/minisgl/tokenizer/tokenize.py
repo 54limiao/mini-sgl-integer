@@ -8,8 +8,9 @@ from transformers import PreTrainedTokenizerBase
 
 
 class TokenizeManager:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, prefix_prompt: str = "") -> None:
         self.tokenizer = tokenizer
+        self.prefix_prompt = prefix_prompt
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
         results: List[torch.Tensor] = []
@@ -24,8 +25,8 @@ class TokenizeManager:
                 assert isinstance(prompt, str)
             else:
                 prompt = msg.text
-            input_ids: torch.Tensor = (  # type: ignore
-                self.tokenizer.encode(prompt, return_tensors="pt")
-            )
-            results.append(input_ids.view(-1).to(torch.int32))
+            prompt = self.prefix_prompt + prompt
+            encoded = self.tokenizer.encode(prompt)
+            input_ids = torch.tensor(encoded, dtype=torch.int32)
+            results.append(input_ids.view(-1))
         return results
