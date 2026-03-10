@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 class LlamaDecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
         self.self_attn = LlamaAttn(config, layer_id)
-        self.mlp = LlamaMLP(config)
+        self.mlp = LlamaMLP(config, layer_id=layer_id)
         self.input_layernorm = RMSNormFused(
             size=config.hidden_size,
             eps=config.rms_norm_eps,
