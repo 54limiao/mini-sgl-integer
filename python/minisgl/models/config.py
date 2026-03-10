@@ -13,6 +13,7 @@ class RotaryConfig:
     max_position: int
     base: float
     scaling: Dict[str, Any] | None
+    apply_hadamard: bool = False
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,7 @@ class HadamardTransformConfig:
     enabled: bool = False
     block_size: int = 0
     targets: Tuple[str, ...] = ()
+    r3_enabled: bool = False
 
 
 def _parse_hadamard_transform_config(config: PretrainedConfig) -> HadamardTransformConfig:
@@ -37,11 +39,15 @@ def _parse_hadamard_transform_config(config: PretrainedConfig) -> HadamardTransf
 
     targets: list[str] = []
     block_size = 0
-    for group in config_groups.values():
+    r3_enabled = False
+    for group_name, group in config_groups.items():
         if not isinstance(group, dict):
             continue
         if str(group.get("type", "")).lower() != "hadamard":
             continue
+
+        if str(group_name).lower() == "r3":
+            r3_enabled = True
 
         candidate_size = group.get("head_dim", group.get("size", 0))
         if isinstance(candidate_size, int) and candidate_size > 0 and block_size <= 0:
@@ -78,6 +84,7 @@ def _parse_hadamard_transform_config(config: PretrainedConfig) -> HadamardTransf
         enabled=enabled,
         block_size=block_size,
         targets=tuple(dedup_targets),
+        r3_enabled=r3_enabled,
     )
 
 
@@ -136,6 +143,8 @@ class ModelConfig:
                 max_position=config.max_position_embeddings,
                 base=config.rope_theta,
                 scaling=getattr(config, "rope_scaling", None),
+                # Float-mode RoPE+FWHT (R3-style) is enabled globally.
+                apply_hadamard=True,
             ),
             num_experts=num_experts,
             num_experts_per_tok=num_experts_per_tok,

@@ -9,6 +9,33 @@ import torch
 from .base import StateLessOP
 
 
+def _fwht_torch(x: torch.Tensor) -> torch.Tensor:
+    size = x.shape[-1]
+    if size <= 0 or size & (size - 1):
+        raise ValueError(f"FWHT last dim must be power-of-two, got {size}")
+
+    out = x
+    step = 1
+    while step < size:
+        paired = out.view(*out.shape[:-1], -1, step * 2)
+        left = paired[..., :step].clone()
+        right = paired[..., step : (step * 2)].clone()
+        paired[..., :step] = left + right
+        paired[..., step : (step * 2)] = left - right
+        step <<= 1
+
+    return out * (1.0 / math.sqrt(size))
+
+
+def _fwht_last_dim(x: torch.Tensor) -> torch.Tensor:
+    orig_dtype = x.dtype
+    work = x.to(torch.float32) if x.dtype == torch.bfloat16 else x.clone()
+    out = _fwht_torch(work)
+    if out.dtype != orig_dtype:
+        out = out.to(orig_dtype)
+    return out
+
+
 class RotaryEmbedding(StateLessOP):
     def __init__(
         self,
@@ -19,6 +46,7 @@ class RotaryEmbedding(StateLessOP):
         post_process: None | Callable[[torch.Tensor], torch.Tensor] = None,
     ) -> None:
         super().__init__()
+        self.apply_hadamard = False
         self.head_size = head_size
         assert rotary_dim == head_size
         inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
@@ -49,6 +77,12 @@ class RotaryEmbedding(StateLessOP):
             head_size=self.head_size,
             cos_sin_cache=self._cos_sin_cache,
         )
+        if self.apply_hadamard:
+            # R3-style path for float inference: apply head-wise Hadamard after RoPE.
+            q_heads = query.view(-1, query.shape[-1] // self.head_size, self.head_size)
+            k_heads = key.view(-1, key.shape[-1] // self.head_size, self.head_size)
+            query.copy_(_fwht_last_dim(q_heads).view_as(query))
+            key.copy_(_fwht_last_dim(k_heads).view_as(key))
         return query, key
 
 
@@ -58,9 +92,12 @@ def _get_rope(
     max_position: int,
     base: float,
     rope_scaling: Dict[str, Any] | None = None,
+    apply_hadamard: bool = False,
 ) -> RotaryEmbedding:
     if rope_scaling is None:
-        return RotaryEmbedding(head_dim, rotary_dim, max_position, base)
+        rope = RotaryEmbedding(head_dim, rotary_dim, max_position, base)
+        rope.apply_hadamard = apply_hadamard
+        return rope
     # need to test some cases:
     match rope_scaling["rope_type"]:
         case "llama3":
@@ -85,7 +122,9 @@ def _get_rope(
                 factor = (1 - smooth) / scaling_factor + smooth
                 return factor * inv_freq
 
-            return RotaryEmbedding(head_dim, rotary_dim, max_position, base, post_process)
+            rope = RotaryEmbedding(head_dim, rotary_dim, max_position, base, post_process)
+            rope.apply_hadamard = apply_hadamard
+            return rope
 
     raise ValueError(f"Unsupported {rope_scaling = }")
 
@@ -105,6 +144,7 @@ def get_rope(
     max_position: int,
     base: float,
     rope_scaling: Tuple[Tuple[str, Any], ...] | None = None,
+    apply_hadamard: bool = False,
 ) -> RotaryEmbedding:
     rope_map = dict(rope_scaling) if rope_scaling is not None else None
     t = torch.tensor([])
@@ -115,8 +155,8 @@ def get_rope(
                 "We cannot use meta device for rope. Please call set_rope_device() first."
             )
         with torch.device(_ROPE_DEVICE):
-            return _get_rope(head_dim, rotary_dim, max_position, base, rope_map)
-    return _get_rope(head_dim, rotary_dim, max_position, base, rope_map)
+            return _get_rope(head_dim, rotary_dim, max_position, base, rope_map, apply_hadamard)
+    return _get_rope(head_dim, rotary_dim, max_position, base, rope_map, apply_hadamard)
 
 
 __all__ = ["get_rope", "RotaryEmbedding", "set_rope_device"]
