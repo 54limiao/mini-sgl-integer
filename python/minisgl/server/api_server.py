@@ -212,6 +212,25 @@ class FrontendManager:
         self.send_tokenizer.stop()
         self.recv_tokenizer.stop()
 
+    def apply_prefix(self, prompt):
+        prefix = self.config.prefix_prompt
+        if not prefix:
+            return prompt
+        if self.config.quant_backend == "int-w8a8-static":
+            return prompt
+        if isinstance(prompt, list):
+            if prompt and prompt[0].get("role") == "system":
+                prompt = [dict(prompt[0], content=f"{prefix}\n{prompt[0].get('content', '')}")] + prompt[1:]
+            else:
+                prompt = [{"role": "system", "content": prefix}] + prompt
+            return prompt
+        return f"{prefix}\n{prompt}"
+
+    def prefix_text(self) -> str:
+        if self.config.quant_backend == "int-w8a8-static":
+            return self.config.prefix_prompt
+        return ""
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -233,7 +252,8 @@ async def generate(req: GenerateRequest, request: Request):
     await state.send_one(
         TokenizeMsg(
             uid=uid,
-            text=req.prompt,
+            text=state.apply_prefix(req.prompt),
+            prefix_text=state.prefix_text(),
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
                 max_tokens=req.max_tokens,
@@ -266,7 +286,8 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     await state.send_one(
         TokenizeMsg(
             uid=uid,
-            text=prompt,
+            text=state.apply_prefix(prompt),
+            prefix_text=state.prefix_text(),
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
                 max_tokens=req.max_tokens,
@@ -326,7 +347,8 @@ async def shell_completion(req: OpenAICompletionRequest):
     await state.send_one(
         TokenizeMsg(
             uid=uid,
-            text=prompt,
+            text=state.apply_prefix(prompt),
+            prefix_text=state.prefix_text(),
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
                 max_tokens=req.max_tokens,

@@ -57,7 +57,7 @@ class PrefillAdder:
         if cached_len > 0:  # NOTE: set the cached part
             device_ids = self.table_manager.token_pool[table_idx][:cached_len]
             page_entry = self.table_manager.page_table[table_idx][:cached_len]
-            device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
+            device_ids.copy_(req.full_input_ids[:cached_len].pin_memory(), non_blocking=True)
             page_entry.copy_(handle.get_matched_indices())
 
         return handle, table_idx
@@ -69,6 +69,7 @@ class PrefillAdder:
         table_idx: int,
         cached_len: int,
     ) -> Req:
+        input_ids = pending_req.full_input_ids
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
         is_chunked = chunk_size < remain_len
@@ -78,9 +79,9 @@ class PrefillAdder:
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
-        device_ids.copy_(pending_req.input_ids[_slice].pin_memory(), non_blocking=True)
+        device_ids.copy_(input_ids[_slice].pin_memory(), non_blocking=True)
         return CLS(
-            input_ids=pending_req.input_ids[: cached_len + chunk_size],
+            input_ids=input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
             cached_len=cached_len,
             output_len=pending_req.output_len,
@@ -121,7 +122,17 @@ class PrefillManager:
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
-        self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
+        input_ids = req.input_ids
+        prefix_ids = req.prefix_ids
+        full_input_ids = input_ids if len(prefix_ids) == 0 else torch.cat((prefix_ids, input_ids))
+        self.pending_list.append(
+            PendingReq(
+                req.uid,
+                input_ids,
+                req.sampling_params,
+                full_input_ids=full_input_ids,
+            )
+        )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:

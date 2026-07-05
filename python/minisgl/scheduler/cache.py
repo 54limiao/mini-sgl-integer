@@ -27,7 +27,7 @@ class CacheManager:
     def match_req(self, req: PendingReq) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
-        return self.prefix_cache.match_prefix(req.input_ids[: input_len - 1])
+        return self.prefix_cache.match_prefix(req.full_input_ids[: input_len - 1])
 
     @property
     def available_size(self) -> int:

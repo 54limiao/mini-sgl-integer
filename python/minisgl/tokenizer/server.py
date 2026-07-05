@@ -85,15 +85,16 @@ def tokenize_worker(
                 send_frontend.put(batch_output)
 
             if len(tokenize_msg) > 0:
-                tensors = tokenize_manager.tokenize(tokenize_msg)
+                tokenized = tokenize_manager.tokenize(tokenize_msg)
                 batch_output = BatchBackendMsg(
                     data=[
                         UserMsg(
                             uid=msg.uid,
-                            input_ids=t,
+                            input_ids=input_ids,
                             sampling_params=msg.sampling_params,
+                            prefix_ids=prefix_ids,
                         )
-                        for msg, t in zip(tokenize_msg, tensors, strict=True)
+                        for msg, (input_ids, prefix_ids) in zip(tokenize_msg, tokenized, strict=True)
                     ]
                 )
                 if len(batch_output.data) == 1:

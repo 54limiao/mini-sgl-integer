@@ -16,11 +16,12 @@ class PendingReq:
     uid: int
     input_ids: torch.Tensor
     sampling_params: SamplingParams
+    full_input_ids: torch.Tensor
     chunked_req: ChunkedReq | None = None
 
     @property
     def input_len(self) -> int:
-        return len(self.input_ids)
+        return len(self.full_input_ids)
 
     @property
     def output_len(self) -> int:

@@ -9,6 +9,10 @@ import torch
 
 import minisgl.core as core
 from minisgl.scheduler.cache import CacheManager
+from minisgl.engine.graph import _determine_cuda_graph_bs
+from minisgl.scheduler.prefill import PrefillAdder
+from minisgl.scheduler.table import TableManager
+from minisgl.scheduler.utils import PendingReq
 
 
 @pytest.fixture(autouse=True)
@@ -53,6 +57,40 @@ def _assert_no_overlap(pages: torch.Tensor, page_size: int):
         overlap = expanded & token_range
         assert len(overlap) == 0, f"Overlapping tokens: {overlap}"
         expanded.update(token_range)
+
+
+def test_cuda_graph_batch_sizes_respect_small_max():
+    assert _determine_cuda_graph_bs(None, 2, free_memory=1 << 30) == [1, 2]
+    assert _determine_cuda_graph_bs(None, 0, free_memory=1 << 30) == []
+
+
+def test_prefill_cached_prefix_copies_full_input_ids():
+    page_table = torch.empty((1, 16), dtype=torch.int32)
+    cm = _make_cache_manager(num_pages=16, page_size=1)
+    tm = TableManager(max_running_reqs=1, page_table=page_table)
+
+    prefix_ids = torch.tensor([10, 11], dtype=torch.int32)
+    input_ids = torch.tensor([20, 21, 22], dtype=torch.int32)
+    full_ids = torch.cat((prefix_ids, input_ids))
+    cached_indices = torch.arange(4, dtype=torch.int32)
+    cm.prefix_cache.insert_prefix(full_ids[:4], cached_indices)
+
+    pending = PendingReq(
+        uid=0,
+        input_ids=input_ids,
+        sampling_params=core.SamplingParams(max_tokens=1),
+        full_input_ids=full_ids,
+    )
+    adder = PrefillAdder(
+        token_budget=8,
+        reserved_size=0,
+        cache_manager=cm,
+        table_manager=tm,
+    )
+    result = adder._try_allocate_one(pending)
+    assert result is not None
+    _, table_idx = result
+    assert tm.token_pool[table_idx, :4].tolist() == full_ids[:4].tolist()
 
 
 class TestAllocateEvictPageAlignment:

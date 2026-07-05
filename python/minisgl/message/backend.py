@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List
 
 import torch
@@ -34,6 +34,9 @@ class UserMsg(BaseBackendMsg):
     uid: int
     input_ids: torch.Tensor  # CPU 1D int32 tensor
     sampling_params: SamplingParams
+    prefix_ids: torch.Tensor = field(
+        default_factory=lambda: torch.empty(0, dtype=torch.int32)
+    )
 
 
 @dataclass

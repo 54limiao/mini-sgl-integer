@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Tuple
 
 import torch
 from minisgl.message import TokenizeMsg
@@ -11,8 +11,8 @@ class TokenizeManager:
     def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
         self.tokenizer = tokenizer
 
-    def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
-        results: List[torch.Tensor] = []
+    def tokenize(self, msgs: List[TokenizeMsg]) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        results: List[Tuple[torch.Tensor, torch.Tensor]] = []
         # TODO: batch tokenization
         for msg in msgs:
             if isinstance(msg.text, list):
@@ -27,5 +27,6 @@ class TokenizeManager:
             input_ids: torch.Tensor = (  # type: ignore
                 self.tokenizer.encode(prompt, return_tensors="pt")
             )
-            results.append(input_ids.view(-1).to(torch.int32))
+            prefix_ids = self.tokenizer.encode(msg.prefix_text, return_tensors="pt") if msg.prefix_text else torch.empty(0, dtype=torch.int64)
+            results.append((input_ids.view(-1).to(torch.int32), prefix_ids.view(-1).to(torch.int32)))
         return results

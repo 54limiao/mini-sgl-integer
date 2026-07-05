@@ -35,7 +35,7 @@ class LLM(Scheduler):
             **kwargs,
         )
         super().__init__(config)
-        self.pending_requests: List[Tuple[List[int] | str, SamplingParams]] = []
+        self.pending_requests: List[Tuple[List[int] | str, SamplingParams, torch.Tensor]] = []
         self.status_map: Dict[int, RequestStatus] = {}
         self.counter = 0
 
@@ -50,13 +50,20 @@ class LLM(Scheduler):
             raise RequestAllFinished()
         results: List[BaseBackendMsg] = []
         added, sum_input_len = 0, 0
-        for tokens_or_prompt, sampling_params in self.pending_requests:
+        for tokens_or_prompt, sampling_params, prefix_ids in self.pending_requests:
             if sum_input_len >= self.prefill_budget:
                 break
             input_ids = self._tokenize_one(tokens_or_prompt)
             sum_input_len += len(input_ids)
             uid, added = self.counter + added, added + 1
-            results.append(UserMsg(uid=uid, input_ids=input_ids, sampling_params=sampling_params))
+            results.append(
+                UserMsg(
+                    uid=uid,
+                    input_ids=input_ids,
+                    sampling_params=sampling_params,
+                    prefix_ids=prefix_ids,
+                )
+            )
             self.status_map[uid] = RequestStatus(
                 uid=uid,
                 input_ids=(
@@ -78,14 +85,20 @@ class LLM(Scheduler):
         self,
         prompts: List[str] | List[List[int]],
         sampling_params: List[SamplingParams] | SamplingParams,
+        prefix_prompt: str = "",
     ) -> List[Dict[str, str | List[int]]]:
         self.pending_requests = []
         self.status_map = {}
         self.counter = 0
         if isinstance(sampling_params, SamplingParams):
             sampling_params = [sampling_params] * len(prompts)
+        prefix_ids = (
+            self.tokenizer.encode(prefix_prompt, return_tensors="pt").view(-1).to(torch.int32)
+            if prefix_prompt
+            else torch.empty(0, dtype=torch.int32)
+        )
         for prompt, sp in zip(prompts, sampling_params):
-            self.pending_requests.append((prompt, sp))
+            self.pending_requests.append((prompt, sp, prefix_ids))
         try:
             self.run_forever()
         except RequestAllFinished:

@@ -36,6 +36,7 @@ class TokenizeMsg(BaseTokenizerMsg):
     uid: int
     text: str | List[Dict[str, str]]
     sampling_params: SamplingParams
+    prefix_text: str = ""
 
 
 @dataclass

@@ -46,6 +46,7 @@ class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from minisgl.engine import Engine
 
+        self.config = config
         self.engine = Engine(config)
 
         # use another stream to overlap metadata processing with computation
@@ -70,7 +71,6 @@ class Scheduler(SchedulerIOMixin):
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
-        # self.config = config
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -174,7 +174,7 @@ class Scheduler(SchedulerIOMixin):
             raise KeyboardInterrupt
         elif isinstance(msg, UserMsg):
             logger.debug_rank0("Received user msg: %s", msg)
-            input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
+            input_len, max_seq_len = len(msg.input_ids) + len(msg.prefix_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:
                 return logger.warning_rank0(
