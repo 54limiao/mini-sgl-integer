@@ -11,6 +11,7 @@ from minisgl.kvcache import create_kvcache_pool
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
 from minisgl.moe import create_moe_backend
+from minisgl.quant import create_quant_context, reset_quant_context, set_quant_context
 from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 
 from .config import EngineConfig
@@ -40,6 +41,8 @@ class Engine:
         self.dtype = config.dtype
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
+        self.quant_context = create_quant_context(config)
+        set_quant_context(self.quant_context)
 
         self.tp_cpu_group = self._init_communication(config)
         init_free_memory = self._sync_get_memory()[1]
@@ -142,8 +145,18 @@ class Engine:
                 k: torch.randn_like(v, device=self.device)
                 for k, v in self.model.state_dict().items()
             }
-        else:
-            return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
+        state = {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
+        quant_ctx = self.quant_context
+        if quant_ctx.is_int_w8a8_static:
+            assert quant_ctx.artifact is not None
+            expected = self.model.state_dict()
+            for key, tensor in expected.items():
+                artifact_tensor = quant_ctx.artifact.optional_tensor(key, self.device)
+                if artifact_tensor is not None:
+                    state[key] = artifact_tensor.to(tensor.dtype)
+                elif key not in state or state[key].shape != tensor.shape or state[key].dtype != tensor.dtype:
+                    state[key] = quant_ctx.artifact.load_tensor(key, self.device).to(tensor.dtype)
+        return state
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
@@ -207,6 +220,7 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
+        reset_quant_context()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 
@@ -218,6 +232,11 @@ def _align_up_32(num: int) -> int:
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
+
+    if config.quant_backend == "int-w8a8-static":
+        if config.attention_backend == "auto":
+            override("attention_backend", "int-w8a8-static")
+        logger.info_rank0("Using int-w8a8-static TileLang backend with bf16 runtime semantics")
 
     if config.attention_backend == "auto":
         backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")

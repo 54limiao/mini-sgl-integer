@@ -16,6 +16,7 @@ class ServerArgs(SchedulerConfig):
     server_host: str = "127.0.0.1"
     server_port: int = 1919
     num_tokenizer: int = 0
+    prefix_prompt: str = ""
     silent_output: bool = False
 
     @property
@@ -162,6 +163,28 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--prefix-prompt",
+        type=str,
+        default=ServerArgs.prefix_prompt,
+        help="Server-side prefix prepended before every request.",
+    )
+
+    parser.add_argument(
+        "--quant-backend",
+        type=str,
+        default=ServerArgs.quant_backend,
+        choices=["none", "int-w8a8-static"],
+        help="Quantized runtime backend.",
+    )
+
+    parser.add_argument(
+        "--quant-artifact",
+        type=str,
+        default=ServerArgs.quant_artifact,
+        help="Path to the quantized model artifact.",
+    )
+
+    parser.add_argument(
         "--max-prefill-length",
         "--max-extend-length",
         type=int,
@@ -235,6 +258,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
+    if kwargs["quant_artifact"] and kwargs["quant_artifact"].startswith("~"):
+        kwargs["quant_artifact"] = os.path.expanduser(kwargs["quant_artifact"])
 
     if kwargs["model_source"] == "modelscope":
         model_path = kwargs["model_path"]

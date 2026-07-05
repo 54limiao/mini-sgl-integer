@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cached_property
+import os
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -17,6 +18,8 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    quant_backend: str = "none"
+    quant_artifact: str | None = None
     max_running_req: int = 256
     attention_backend: str = "auto"
     moe_backend: str = "auto"
@@ -52,4 +55,4 @@ class EngineConfig:
 
     @property
     def distributed_addr(self) -> str:
-        return "tcp://127.0.0.1:2333"
+        return f"tcp://127.0.0.1:{os.environ.get('MINISGL_MASTER_PORT', '2333')}"
