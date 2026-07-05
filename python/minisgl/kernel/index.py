@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import functools
+import os
 from typing import TYPE_CHECKING, Tuple
+
+import torch
 
 from .utils import KernelConfig, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
-    import torch
     from tvm_ffi import Module
 
 DEFAULT_INDEX_KERNEL_CONFIG = KernelConfig(num_threads=128, max_occupancy=1, use_pdl=False)
@@ -35,6 +37,17 @@ def indexing(
     output: torch.Tensor | None = None,
     vocab_range: Tuple[int, int] | None = None,  # (start, length)
 ) -> torch.Tensor:
+    if os.environ.get("MINISGL_INDEX_REF") == "1":
+        if vocab_range is None:
+            return weights[indices.long()].contiguous()
+        start, length = vocab_range
+        local = indices.long() - start
+        mask = (local >= 0) & (local < length)
+        out = weights.new_zeros(indices.shape[0], weights.shape[1])
+        if mask.any():
+            out[mask] = weights[local[mask]]
+        return out
+
     if output is None:
         output = weights.new_empty(indices.shape[0], weights.shape[1])
 

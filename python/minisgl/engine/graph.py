@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
@@ -64,7 +65,8 @@ def _determine_cuda_graph_bs(
     if cuda_graph_max_bs < 1:
         return []
 
-    return [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
+    base_bs = [bs for bs in (1, 2, 4) if bs <= cuda_graph_max_bs]
+    return base_bs + list(range(8, cuda_graph_max_bs + 1, 8))
 
 
 def mem_GB(size: int) -> str:
@@ -145,6 +147,10 @@ class GraphRunner:
 
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
+        if os.environ.get("MINISGL_CUDA_PROFILE") == "1":
+            from minisgl.kernel.tilelang.profile import reset_cuda_profile
+
+            reset_cuda_profile()
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs
