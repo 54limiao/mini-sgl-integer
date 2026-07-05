@@ -32,8 +32,10 @@ class RotaryEmbedding(StateLessOP):
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
         assert self.head_size in [64, 128, 256, 512]
 
-        from flashinfer import apply_rope_with_cos_sin_cache_inplace
-
+        try:
+            from flashinfer import apply_rope_with_cos_sin_cache_inplace
+        except ImportError:
+            apply_rope_with_cos_sin_cache_inplace = None
         self.apply_rope_with_cos_sin_cache_inplace = apply_rope_with_cos_sin_cache_inplace
 
     def forward(
@@ -42,14 +44,38 @@ class RotaryEmbedding(StateLessOP):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self.apply_rope_with_cos_sin_cache_inplace(
-            positions=positions,
-            query=query,
-            key=key,
-            head_size=self.head_size,
-            cos_sin_cache=self._cos_sin_cache,
-        )
+        if self.apply_rope_with_cos_sin_cache_inplace is None:
+            self._torch_apply_rope_inplace(positions, query, key)
+        else:
+            self.apply_rope_with_cos_sin_cache_inplace(
+                positions=positions,
+                query=query,
+                key=key,
+                head_size=self.head_size,
+                cos_sin_cache=self._cos_sin_cache,
+            )
         return query, key
+
+    def _torch_apply_rope_inplace(
+        self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor
+    ) -> None:
+        cache = self._cos_sin_cache.to(device=query.device)
+        cos, sin = cache[positions].chunk(2, dim=-1)
+
+        def apply(x: torch.Tensor) -> torch.Tensor:
+            shape = x.shape
+            x = x.view(shape[0], -1, self.head_size)
+            x1 = x[..., : self.head_size // 2].to(torch.float32)
+            x2 = x[..., self.head_size // 2 :].to(torch.float32)
+            c = cos.view(-1, 1, cos.shape[-1]).to(torch.float32)
+            s = sin.view(-1, 1, sin.shape[-1]).to(torch.float32)
+            y = torch.empty_like(x)
+            y[..., : self.head_size // 2] = (x1 * c - x2 * s).to(x.dtype)
+            y[..., self.head_size // 2 :] = (x1 * s + x2 * c).to(x.dtype)
+            return y.view(shape)
+
+        query.copy_(apply(query))
+        key.copy_(apply(key))
 
 
 def _get_rope(

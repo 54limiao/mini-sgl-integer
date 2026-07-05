@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
 from minisgl.layers import (
     AttentionLayer,
     BaseOP,
@@ -16,6 +17,7 @@ from minisgl.layers import (
     silu_and_mul,
 )
 from minisgl.models import ModelConfig
+from minisgl.quant import get_quant_context
 from minisgl.utils import nvtx_annotate
 
 if TYPE_CHECKING:
@@ -24,6 +26,7 @@ if TYPE_CHECKING:
 
 class GatedMLP(BaseOP):
     def __init__(self, config: ModelConfig):
+        self.head_dim = config.head_dim
         self.gate_up_proj = LinearColParallelMerged(
             config.hidden_size,
             [config.intermediate_size, config.intermediate_size],
@@ -45,7 +48,12 @@ class GatedMLP(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj.forward(x)
         del x
-        y = self.act_fn(gate_up)
+        if get_quant_context().is_int_w8a8_static:
+            from minisgl.kernel.tilelang import silu_hadamard_quant_i8
+
+            y = silu_hadamard_quant_i8(gate_up, self.down_proj.input_scale, self.head_dim)
+        else:
+            y = self.act_fn(gate_up)
         del gate_up
         return self.down_proj.forward(y)
 

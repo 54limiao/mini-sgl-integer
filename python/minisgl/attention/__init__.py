@@ -40,6 +40,13 @@ def create_fa_backend(config: ModelConfig):
     return FlashAttentionBackend(config)
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register("int-w8a8-static")
+def create_int_w8a8_static_backend(config: ModelConfig):
+    from .tilelang_int_w8a8_static import TileLangIntW8A8StaticBackend
+
+    return TileLangIntW8A8StaticBackend(config)
+
+
 def validate_attn_backend(backend: str, allow_auto: bool = True):
     if backend != "auto":
         required_backends = backend.split(",") if "," in backend else [backend]

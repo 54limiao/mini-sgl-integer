@@ -5,6 +5,7 @@ from typing import List
 import torch
 import torch.nn.functional as F
 from minisgl.distributed import DistributedCommunicator, get_tp_info
+from minisgl.quant import get_quant_context
 from minisgl.utils import div_even
 
 from .base import BaseOP
@@ -25,10 +26,31 @@ class _LinearTPImpl(BaseOP):
         self.full_output_size = full_osize
         self.local_input_size = local_isize
         self.local_output_size = local_osize
-        self.weight = torch.empty(local_osize, local_isize)
+        quant_ctx = get_quant_context()
+        self._quant_backend = quant_ctx.backend
+        if quant_ctx.is_int_w8a8_static:
+            self.weight = torch.empty(local_osize, local_isize, dtype=torch.int8)
+            self.weight_scale = torch.empty(local_osize, dtype=torch.float32)
+            self.input_scale = torch.empty(1, dtype=torch.float32)
+            self.output_scale = torch.empty(1, dtype=torch.float32)
+        else:
+            self.weight = torch.empty(local_osize, local_isize)
         self.bias = torch.empty(local_osize) if has_bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._quant_backend == "int-w8a8-static":
+            from minisgl.kernel.tilelang import w8a8_static_linear
+
+            y = w8a8_static_linear(
+                x,
+                self.weight,
+                self.input_scale,
+                self.weight_scale,
+                self.output_scale,
+            )
+            if self.bias is not None:
+                y = y + self.bias.to(y.dtype)
+            return y
         return F.linear(x, self.weight, self.bias)
 
 
@@ -100,7 +122,7 @@ class LinearOProj(_LinearTPImpl):
         super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
+        y = super().forward(x)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y
@@ -121,7 +143,7 @@ class LinearRowParallel(_LinearTPImpl):
         super().__init__(input_size, output_size, local_input_size, local_output_size, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
+        y = super().forward(x)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y

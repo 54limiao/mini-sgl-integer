@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from minisgl.core import get_global_ctx
 from minisgl.distributed import DistributedCommunicator, get_tp_info
+from minisgl.quant import get_quant_context
 from minisgl.utils import div_ceil, nvtx_annotate
 
 from .base import BaseOP
@@ -31,6 +32,17 @@ class VocabParallelEmbedding(BaseOP):
 
     @nvtx_annotate("Embedding")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if get_quant_context().is_int_w8a8_static:
+            if self.tp_size == 1:
+                return self.weight[x.long()].contiguous()
+            start, length = self.vocab_range
+            local = x.long() - start
+            mask = (local >= 0) & (local < length)
+            y = self.weight.new_zeros(x.shape[0], self.weight.shape[1])
+            if mask.any():
+                y[mask] = self.weight[local[mask]]
+            return self._comm.all_reduce(y)
+
         from minisgl.kernel import indexing
 
         y = indexing(
@@ -54,6 +66,12 @@ class ParallelLMHead(VocabParallelEmbedding):
         super().__init__(num_embeddings, embedding_dim)
         self.bias = torch.empty(self.num_embeddings_tp) if bias else None
         self.tied_embedding = tied_embedding
+        quant_ctx = get_quant_context()
+        self._quant_backend = quant_ctx.backend
+        if quant_ctx.is_int_w8a8_static:
+            self.i8_weight = torch.empty_like(self.weight, dtype=torch.int8)
+            self.i8_weight_scale = torch.empty(self.num_embeddings_tp, dtype=torch.float32)
+            self.input_scale = torch.empty(1, dtype=torch.float32)
         assert (tied_embedding is not None) == tie_word_embeddings
 
     def load_state_dict(
@@ -63,6 +81,26 @@ class ParallelLMHead(VocabParallelEmbedding):
         prefix: str = "",
         _internal: bool = False,
     ) -> None:
+        if self._quant_backend == "int-w8a8-static":
+            base = f"{prefix}." if prefix else ""
+
+            def pop_any(*names: str) -> torch.Tensor:
+                for name in names:
+                    value = state_dict.pop(name, None)
+                    if value is not None:
+                        return value
+                raise KeyError(names[0])
+
+            self.i8_weight = pop_any(f"{base}i8.weight", f"{base}i8_weight")
+            self.i8_weight_scale = pop_any(f"{base}i8.weight_scale", f"{base}i8_weight_scale")
+            self.input_scale = state_dict.pop(f"{base}input_scale")
+            if not self.tied_embedding:
+                self.weight = state_dict.pop(f"{base}weight")
+            state_dict.pop(f"{base}i8.weight", None)
+            state_dict.pop(f"{base}i8.weight_scale", None)
+            state_dict.pop(f"{base}i8_weight", None)
+            state_dict.pop(f"{base}i8_weight_scale", None)
+            return
         if not self.tied_embedding:
             return super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
         else:
@@ -81,8 +119,15 @@ class ParallelLMHead(VocabParallelEmbedding):
         result: Dict[str, torch.Tensor] | None = None,
     ) -> Dict[str, torch.Tensor]:
         if not self.tied_embedding:
-            return super().state_dict(prefix=prefix, result=result)
-        return {} if result is None else result
+            result = super().state_dict(prefix=prefix, result=result)
+        elif result is None:
+            result = {}
+        if self._quant_backend == "int-w8a8-static":
+            base = f"{prefix}." if prefix else ""
+            result[f"{base}i8.weight"] = self.i8_weight
+            result[f"{base}i8.weight_scale"] = self.i8_weight_scale
+            result[f"{base}input_scale"] = self.input_scale
+        return result
 
     @nvtx_annotate("LMHead")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -95,7 +140,20 @@ class ParallelLMHead(VocabParallelEmbedding):
             del indices
 
         module = self.tied_embedding or self
-        logits = F.linear(x, module.weight, self.bias)
+        if self._quant_backend == "int-w8a8-static":
+            from minisgl.kernel.tilelang import w8a8_static_linear
+
+            logits = w8a8_static_linear(
+                x,
+                self.i8_weight,
+                self.input_scale,
+                self.i8_weight_scale,
+                self.input_scale,
+            ).float()
+            if self.bias is not None:
+                logits = logits + self.bias.float()
+        else:
+            logits = F.linear(x, module.weight, self.bias)
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape
